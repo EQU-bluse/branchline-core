@@ -6,6 +6,7 @@ const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const DECIMAL_INTEGER_PATTERN = /^\d+$/;
 const EVENT_QUERY_PARAMS = new Set(["from", "to", "limit", "cursor"]);
 const REPLAY_DIFF_QUERY_PARAMS = new Set(["against"]);
+const REPLAY_EXPLAIN_QUERY_PARAMS = new Set(["ruleId", "sourceSequence"]);
 const DEFAULT_EVENTS_LIMIT = 50;
 const MAX_EVENTS_LIMIT = 100;
 
@@ -565,6 +566,99 @@ export function createApp(store = createScenarioStore()) {
     });
   }
 
+  function buildAncestry(scenario) {
+    const ancestry = [];
+    let current = scenario;
+    while (current !== undefined) {
+      const parentScenarioId = current.parentScenarioId ?? null;
+      const parentRevision = current.parentRevision ?? null;
+      ancestry.push({ scenarioId: current.id, parentScenarioId, parentRevision });
+      current = parentScenarioId === null ? undefined : store.scenarios.get(parentScenarioId);
+    }
+    return ancestry;
+  }
+
+  function replayExplain(response, id, url) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const paramKeys = new Set(url.searchParams.keys());
+    for (const key of paramKeys) {
+      if (!REPLAY_EXPLAIN_QUERY_PARAMS.has(key)) {
+        badRequest(response, `Unknown query parameter: ${key}`);
+        return;
+      }
+    }
+
+    const ruleIdValues = url.searchParams.getAll("ruleId");
+    if (ruleIdValues.length !== 1) {
+      badRequest(response, "ruleId must appear exactly once");
+      return;
+    }
+    const ruleId = ruleIdValues[0];
+    if (!isNonEmptyString(ruleId)) {
+      badRequest(response, "ruleId must be a non-empty string");
+      return;
+    }
+
+    const sourceSequenceValues = url.searchParams.getAll("sourceSequence");
+    if (sourceSequenceValues.length !== 1) {
+      badRequest(response, "sourceSequence must appear exactly once");
+      return;
+    }
+    const sourceSequenceRaw = sourceSequenceValues[0];
+    if (sourceSequenceRaw.length === 0) {
+      badRequest(response, "sourceSequence must not be empty");
+      return;
+    }
+    if (!DECIMAL_INTEGER_PATTERN.test(sourceSequenceRaw) || sourceSequenceRaw.length > 9) {
+      badRequest(response, "sourceSequence must be a positive decimal integer");
+      return;
+    }
+    const sourceSequence = Number(sourceSequenceRaw);
+    if (!Number.isInteger(sourceSequence) || sourceSequence < 1) {
+      badRequest(response, "sourceSequence must be a positive decimal integer");
+      return;
+    }
+
+    const rule = (store.rules.get(id) ?? []).find(candidate => candidate.id === ruleId);
+    if (rule === undefined) {
+      badRequest(response, "ruleId does not belong to this scenario");
+      return;
+    }
+
+    const event = scenario.events.find(candidate => candidate.sequence === sourceSequence);
+    if (event === undefined) {
+      badRequest(response, "sourceSequence does not match an event in this scenario");
+      return;
+    }
+
+    if (rule.when.type !== event.type) {
+      badRequest(response, "rule does not match this event");
+      return;
+    }
+
+    const result = {
+      ruleId: rule.id,
+      sourceSequence: event.sequence,
+      type: rule.then.type,
+      payload: rule.then.payload ?? {},
+      occurredAt: event.occurredAt
+    };
+
+    sendJson(response, 200, {
+      scenarioId: id,
+      revision: scenario.revision,
+      result,
+      event,
+      rule,
+      ancestry: buildAncestry(scenario)
+    });
+  }
+
   function readSingleParam(url, name) {
     const values = url.searchParams.getAll(name);
     if (values.length > 1) {
@@ -774,6 +868,17 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "GET") {
           replayDiff(response, id, url);
+          return;
+        }
+      } else if (
+        segments.length === 5
+        && segments[1] === "scenarios"
+        && segments[3] === "replay"
+        && segments[4] === "explain"
+      ) {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "GET") {
+          replayExplain(response, id, url);
           return;
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {
