@@ -1,6 +1,80 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac, timingSafeEqual } from "node:crypto";
 
 const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
+
+const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const DECIMAL_INTEGER_PATTERN = /^\d+$/;
+const EVENT_QUERY_PARAMS = new Set(["from", "to", "limit", "cursor"]);
+const DEFAULT_EVENTS_LIMIT = 50;
+const MAX_EVENTS_LIMIT = 100;
+
+// Per-process secret so cursors cannot be forged or tampered with.
+const cursorSecret = randomUUID();
+
+function signCursorToken(token) {
+  return createHmac("sha256", cursorSecret).update(token).digest("base64url");
+}
+
+function parseUtcTimestamp(value) {
+  if (typeof value !== "string" || !UTC_TIMESTAMP_PATTERN.test(value)) {
+    return null;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime()) || date.toISOString() !== value) {
+    return null;
+  }
+  return date;
+}
+
+function encodeCursor(payload) {
+  const token = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return `${token}.${signCursorToken(token)}`;
+}
+
+function decodeCursor(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    return null;
+  }
+  const dot = value.lastIndexOf(".");
+  if (dot <= 0 || dot === value.length - 1 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value)) {
+    return null;
+  }
+  const token = value.slice(0, dot);
+  const signature = value.slice(dot + 1);
+  const expected = signCursorToken(token);
+  if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    return null;
+  }
+  let data;
+  try {
+    data = JSON.parse(Buffer.from(token, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(data) || data.v !== 1) {
+    return null;
+  }
+  const { sid, from, to, limit, seq, rev } = data;
+  if (typeof sid !== "string" || sid.length === 0) {
+    return null;
+  }
+  if (from !== null && typeof from !== "string") {
+    return null;
+  }
+  if (to !== null && typeof to !== "string") {
+    return null;
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_EVENTS_LIMIT) {
+    return null;
+  }
+  if (!Number.isInteger(seq) || seq < 1) {
+    return null;
+  }
+  if (!Number.isInteger(rev) || rev < 0) {
+    return null;
+  }
+  return { sid, from: from ?? null, to: to ?? null, limit, seq, rev };
+}
 
 function sendJson(response, statusCode, value) {
   response.writeHead(statusCode, jsonHeaders);
@@ -151,6 +225,145 @@ export function createApp(store = createScenarioStore()) {
     sendJson(response, 201, event);
   }
 
+  function readSingleParam(url, name) {
+    const values = url.searchParams.getAll(name);
+    if (values.length > 1) {
+      return { error: `${name} must appear at most once` };
+    }
+    return { value: values.length === 1 ? values[0] : undefined };
+  }
+
+  function listEvents(response, id, url) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const paramKeys = new Set(url.searchParams.keys());
+    for (const key of paramKeys) {
+      if (!EVENT_QUERY_PARAMS.has(key)) {
+        badRequest(response, `Unknown query parameter: ${key}`);
+        return;
+      }
+    }
+
+    let fromIso = null;
+    let toIso = null;
+    let limit = DEFAULT_EVENTS_LIMIT;
+    let cursorToken = undefined;
+
+    for (const name of ["from", "to", "limit", "cursor"]) {
+      const result = readSingleParam(url, name);
+      if (result.error) {
+        badRequest(response, result.error);
+        return;
+      }
+      const raw = result.value;
+      if (raw === undefined) {
+        continue;
+      }
+      if (raw === "") {
+        badRequest(response, `${name} must not be empty`);
+        return;
+      }
+      if (name === "from" || name === "to") {
+        const date = parseUtcTimestamp(raw);
+        if (date === null) {
+          badRequest(response, `${name} must be a UTC timestamp formatted as YYYY-MM-DDTHH:mm:ss.SSSZ`);
+          return;
+        }
+        if (name === "from") {
+          fromIso = raw;
+        } else {
+          toIso = raw;
+        }
+      } else if (name === "limit") {
+        if (!DECIMAL_INTEGER_PATTERN.test(raw) || raw.length > 9) {
+          badRequest(response, "limit must be a decimal integer between 1 and 100");
+          return;
+        }
+        limit = Number(raw);
+        if (limit < 1 || limit > MAX_EVENTS_LIMIT) {
+          badRequest(response, "limit must be a decimal integer between 1 and 100");
+          return;
+        }
+      } else {
+        cursorToken = raw;
+      }
+    }
+
+    if (fromIso !== null && toIso !== null && Date.parse(toIso) < Date.parse(fromIso)) {
+      badRequest(response, "to must not be earlier than from");
+      return;
+    }
+
+    let cursor = null;
+    if (cursorToken !== undefined) {
+      cursor = decodeCursor(cursorToken);
+      if (cursor === null) {
+        badRequest(response, "cursor is invalid");
+        return;
+      }
+      if (
+        cursor.sid !== id
+        || cursor.from !== fromIso
+        || cursor.to !== toIso
+        || cursor.limit !== limit
+      ) {
+        badRequest(response, "cursor does not match this query");
+        return;
+      }
+      if (cursor.rev !== scenario.revision) {
+        badRequest(response, "cursor is no longer valid because the scenario was modified");
+        return;
+      }
+    }
+
+    const fromTime = fromIso === null ? null : Date.parse(fromIso);
+    const toTime = toIso === null ? null : Date.parse(toIso);
+    const afterSequence = cursor === null ? 0 : cursor.seq;
+
+    const page = [];
+    let nextSequence = 0;
+    for (const event of scenario.events) {
+      if (event.sequence <= afterSequence) {
+        continue;
+      }
+      const occurredAt = Date.parse(event.occurredAt);
+      if (fromTime !== null && occurredAt < fromTime) {
+        continue;
+      }
+      if (toTime !== null && occurredAt > toTime) {
+        continue;
+      }
+      if (page.length === limit) {
+        nextSequence = page[page.length - 1].sequence;
+        break;
+      }
+      page.push(event);
+    }
+
+    let nextCursor = null;
+    if (nextSequence > 0) {
+      nextCursor = encodeCursor({
+        v: 1,
+        sid: id,
+        from: fromIso,
+        to: toIso,
+        limit,
+        seq: nextSequence,
+        rev: scenario.revision
+      });
+    }
+
+    sendJson(response, 200, {
+      revision: scenario.revision,
+      events: page,
+      nextCursor
+    });
+  }
+
   async function handleRequest(request, response) {
     const url = new URL(request.url ?? "/", "http://branchline.local");
     const segments = url.pathname.split("/");
@@ -184,6 +397,10 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "POST") {
           await appendEvent(request, response, id);
+          return;
+        }
+        if (request.method === "GET") {
+          listEvents(response, id, url);
           return;
         }
       }

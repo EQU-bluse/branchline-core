@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
+import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
-import { createApp } from "../src/app.js";
+import { createApp, createScenarioStore } from "../src/app.js";
 
 async function withServer(run, app = createApp()) {
   const server = createServer(app.handleRequest);
@@ -264,5 +265,584 @@ test("invalid event requests return 400 without changing revision", async () => 
     const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
     assert.equal(fetched.body.revision, 0);
     assert.deepEqual(fetched.body.events, []);
+  });
+});
+
+async function createScenarioWithEvents(baseUrl, count, name = "Paging") {
+  const created = await requestJson(baseUrl, "/scenarios", {
+    method: "POST",
+    body: JSON.stringify({ name })
+  });
+  const id = created.body.id;
+  const events = [];
+  for (let index = 0; index < count; index += 1) {
+    const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: `event-${index + 1}`, payload: { index } })
+    });
+    assert.equal(result.status, 201);
+    events.push(result.body);
+  }
+  return { id, events };
+}
+
+async function fetchAllEventPages(baseUrl, id, initialQuery = "") {
+  const seen = [];
+  const separator = initialQuery.includes("?") ? "&" : "?";
+  const baseQuery = initialQuery === "" ? "" : initialQuery;
+  let cursor = null;
+  let pages = 0;
+  for (;;) {
+    const cursorPart = cursor === null ? "" : `${separator}cursor=${encodeURIComponent(cursor)}`;
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events${baseQuery}${cursorPart}`);
+    assert.equal(page.status, 200);
+    pages += 1;
+    seen.push(...page.body.events);
+    if (page.body.nextCursor === null) {
+      break;
+    }
+    cursor = page.body.nextCursor;
+    if (pages > 1000) {
+      throw new Error("pagination did not terminate");
+    }
+  }
+  return { events: seen, pages };
+}
+
+function seedScenario(timestamps) {
+  const store = createScenarioStore();
+  const id = randomUUID();
+  const scenario = {
+    id,
+    name: "Seeded",
+    description: "",
+    revision: timestamps.length,
+    createdAt: "2024-01-01T00:00:00.000Z",
+    events: timestamps.map((occurredAt, index) => ({
+      id: randomUUID(),
+      type: `event-${index + 1}`,
+      payload: { index },
+      occurredAt,
+      sequence: index + 1
+    }))
+  };
+  store.scenarios.set(id, scenario);
+  return { store, id, scenario, events: scenario.events };
+}
+
+function timestamps(count, startSecond = 0) {
+  return Array.from(
+    { length: count },
+    (_, index) => `2024-01-01T00:00:${String(startSecond + index).padStart(2, "0")}.000Z`
+  );
+}
+
+test("GET events returns 404 JSON for an unknown scenario", async () => {
+  await withServer(async baseUrl => {
+    const result = await requestJson(baseUrl, "/scenarios/unknown/events");
+    assert.equal(result.status, 404);
+    assert.deepEqual(result.body, { error: "not_found", message: "Scenario not found" });
+
+    const withParams = await requestJson(baseUrl, "/scenarios/unknown/events?limit=1");
+    assert.equal(withParams.status, 404);
+    assert.equal(withParams.body.error, "not_found");
+  });
+});
+
+test("GET events lists events in ascending sequence with default limit", async () => {
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 3);
+
+    const result = await requestJson(baseUrl, `/scenarios/${id}/events`);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.revision, 3);
+    assert.deepEqual(result.body.events, events);
+    assert.deepEqual(
+      result.body.events.map(event => event.sequence),
+      [1, 2, 3]
+    );
+    assert.equal(result.body.nextCursor, null);
+  });
+});
+
+test("GET events on an empty timeline returns an empty page without a cursor", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Empty" })
+    });
+
+    const result = await requestJson(baseUrl, `/scenarios/${created.body.id}/events`);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.revision, 0);
+    assert.deepEqual(result.body.events, []);
+    assert.equal(result.body.nextCursor, null);
+  });
+});
+
+test("default limit is 50 and exact-page results have no next cursor", async () => {
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 50);
+
+    const result = await requestJson(baseUrl, `/scenarios/${id}/events`);
+    assert.equal(result.status, 200);
+    assert.equal(result.body.events.length, 50);
+    assert.deepEqual(result.body.events, events);
+    assert.equal(result.body.nextCursor, null);
+  });
+});
+
+test("pagination walks every event without duplicates or gaps", async () => {
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 12);
+
+    for (const limit of [1, 3, 5, 7, 12, 100]) {
+      const { events: seen, pages } = await fetchAllEventPages(baseUrl, id, `?limit=${limit}`);
+      assert.deepEqual(seen, events, `limit=${limit}`);
+      assert.deepEqual(
+        seen.map(event => event.sequence),
+        events.map(event => event.sequence),
+        `limit=${limit} sequences`
+      );
+      assert.equal(pages, Math.ceil(12 / limit), `limit=${limit} page count`);
+    }
+  });
+});
+
+test("each page is stable: repeating a cursor returns the same events", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 7);
+
+    const first = await requestJson(baseUrl, `/scenarios/${id}/events?limit=3`);
+    assert.equal(first.body.events.length, 3);
+    assert.equal(typeof first.body.nextCursor, "string");
+
+    const second = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=3&cursor=${encodeURIComponent(first.body.nextCursor)}`
+    );
+    const secondAgain = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=3&cursor=${encodeURIComponent(first.body.nextCursor)}`
+    );
+    assert.deepEqual(second.body.events, secondAgain.body.events);
+    assert.deepEqual(second.body.nextCursor, secondAgain.body.nextCursor);
+
+    const sequences = [
+      ...first.body.events,
+      ...second.body.events,
+      ...secondAgain.body.events
+    ].map(event => event.sequence);
+    assert.deepEqual(sequences, [1, 2, 3, 4, 5, 6, 4, 5, 6]);
+  });
+});
+
+test("range filters use a closed interval on occurredAt and default to unbounded", async () => {
+  const seeded = seedScenario(timestamps(5));
+  await withServer(async baseUrl => {
+    const { id, events } = seeded;
+    const stamps = events.map(event => event.occurredAt);
+
+    const within = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=${encodeURIComponent(stamps[1])}&to=${encodeURIComponent(stamps[3])}`
+    );
+    assert.equal(within.status, 200);
+    assert.deepEqual(
+      within.body.events.map(event => event.sequence),
+      [2, 3, 4]
+    );
+    assert.equal(within.body.nextCursor, null);
+
+    const fromOnly = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=${encodeURIComponent(stamps[3])}`
+    );
+    assert.deepEqual(
+      fromOnly.body.events.map(event => event.sequence),
+      [4, 5]
+    );
+
+    const toOnly = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?to=${encodeURIComponent(stamps[1])}`
+    );
+    assert.deepEqual(
+      toOnly.body.events.map(event => event.sequence),
+      [1, 2]
+    );
+
+    const equality = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=${encodeURIComponent(stamps[2])}&to=${encodeURIComponent(stamps[2])}`
+    );
+    assert.deepEqual(
+      equality.body.events.map(event => event.sequence),
+      [3]
+    );
+
+    // Millisecond precision: values a millisecond either side of an event stay excluded.
+    const subMs = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=2024-01-01T00:00:01.001Z&to=2024-01-01T00:00:02.999Z`
+    );
+    assert.deepEqual(
+      subMs.body.events.map(event => event.sequence),
+      [3]
+    );
+  }, createApp(seeded.store));
+});
+
+test("range filtering combined with pagination stays continuous", async () => {
+  const seeded = seedScenario(timestamps(9));
+  await withServer(async baseUrl => {
+    const { id, events } = seeded;
+    const stamps = events.map(event => event.occurredAt);
+    const query = `?from=${encodeURIComponent(stamps[2])}&to=${encodeURIComponent(stamps[7])}&limit=2`;
+
+    const { events: seen, pages } = await fetchAllEventPages(baseUrl, id, query);
+    assert.deepEqual(
+      seen.map(event => event.sequence),
+      [3, 4, 5, 6, 7, 8]
+    );
+    assert.equal(pages, 3);
+  }, createApp(seeded.store));
+});
+
+test("a range matching no events returns an empty page without a cursor", async () => {
+  const seeded = seedScenario(timestamps(3));
+  await withServer(async baseUrl => {
+    const { id } = seeded;
+
+    const after = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=2999-01-01T00:00:00.000Z`
+    );
+    assert.equal(after.status, 200);
+    assert.deepEqual(after.body.events, []);
+    assert.equal(after.body.nextCursor, null);
+
+    const before = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?to=2000-01-01T00:00:00.000Z`
+    );
+    assert.deepEqual(before.body.events, []);
+    assert.equal(before.body.nextCursor, null);
+
+    const gap = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=2030-01-01T00:00:00.000Z&to=2031-01-01T00:00:00.000Z`
+    );
+    assert.deepEqual(gap.body.events, []);
+    assert.equal(gap.body.nextCursor, null);
+  }, createApp(seeded.store));
+});
+
+test("limit must be a decimal integer between 1 and 100", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 1);
+
+    for (const limit of ["0", "-1", "101", "1.5", "abc", "1e2", " 1", "1 ", "+1", "NaN", "Infinity", "0x10"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events?limit=${encodeURIComponent(limit)}`);
+      assert.equal(result.status, 400, `limit=${limit}`);
+      assert.equal(typeof result.body.error, "string", `limit=${limit}`);
+    }
+
+    for (const limit of ["1", "50", "100"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events?limit=${limit}`);
+      assert.equal(result.status, 200, `limit=${limit}`);
+    }
+  });
+});
+
+test("invalid timestamp formats return 400", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 1);
+
+    const invalid = [
+      "2024-01-01T00:00:00Z",
+      "2024-01-01T00:00:00.00Z",
+      "2024-01-01T00:00:00.000+00:00",
+      "2024-01-01 00:00:00.000Z",
+      "2024-1-1T00:00:00.000Z",
+      "2024-01-01t00:00:00.000z",
+      "not-a-date",
+      "2024-02-30T12:00:00.000Z",
+      "2023-02-29T00:00:00.000Z",
+      "2024-13-01T00:00:00.000Z",
+      "2024-01-01T24:00:00.000Z"
+    ];
+
+    for (const value of invalid) {
+      const result = await requestJson(
+        baseUrl,
+        `/scenarios/${id}/events?from=${encodeURIComponent(value)}`
+      );
+      assert.equal(result.status, 400, `from=${value}`);
+      assert.equal(typeof result.body.error, "string", `from=${value}`);
+    }
+
+    const valid = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?to=2024-02-29T00:00:00.000Z`
+    );
+    assert.equal(valid.status, 200);
+  });
+});
+
+test("to earlier than from returns 400; equal bounds are accepted", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 1);
+
+    const earlier = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=2024-01-02T00:00:00.000Z&to=2024-01-01T00:00:00.000Z`
+    );
+    assert.equal(earlier.status, 400);
+    assert.equal(typeof earlier.body.error, "string");
+
+    const equal = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=2024-01-01T00:00:00.000Z&to=2024-01-01T00:00:00.000Z`
+    );
+    assert.equal(equal.status, 200);
+  });
+});
+
+test("duplicated or empty query parameters return 400", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 1);
+
+    const cases = [
+      "limit=1&limit=2",
+      "from=2024-01-01T00:00:00.000Z&from=2024-02-01T00:00:00.000Z",
+      "to=2024-01-01T00:00:00.000Z&to=2024-02-01T00:00:00.000Z",
+      "cursor=a&cursor=b",
+      "limit=",
+      "from=",
+      "to=",
+      "cursor=",
+      "bogus=1"
+    ];
+
+    for (const query of cases) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events?${query}`);
+      assert.equal(result.status, 400, query);
+      assert.equal(typeof result.body.error, "string", query);
+    }
+  });
+});
+
+test("pagination handles more events than the maximum limit", async () => {
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 150);
+
+    const { events: seen, pages } = await fetchAllEventPages(baseUrl, id, "?limit=100");
+    assert.equal(pages, 2);
+    assert.deepEqual(seen, events);
+    assert.deepEqual(
+      seen.map(event => event.sequence),
+      Array.from({ length: 150 }, (_, index) => index + 1)
+    );
+  });
+});
+
+test("a cursor requires the same limit on the follow-up request", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 4);
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=2`);
+
+    // Omitting limit falls back to the default of 50, which no longer matches the cursor.
+    const withoutLimit = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(withoutLimit.status, 400);
+    assert.equal(typeof withoutLimit.body.error, "string");
+
+    const withLimit = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=2&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(withLimit.status, 200);
+    assert.deepEqual(
+      withLimit.body.events.map(event => event.sequence),
+      [3, 4]
+    );
+    assert.equal(withLimit.body.nextCursor, null);
+  });
+});
+
+test("invalid and tampered cursors return 400", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 4);
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=2`);
+    const cursor = page.body.nextCursor;
+    assert.equal(typeof cursor, "string");
+
+    const invalid = [
+      "",
+      "not-base64!",
+      "abc.def",
+      "###",
+      cursor.replace(/.$/, cursor.endsWith("A") ? "B" : "A"),
+      `${cursor}x`
+    ];
+
+    for (const value of invalid) {
+      const result = await requestJson(
+        baseUrl,
+        `/scenarios/${id}/events?limit=2&cursor=${encodeURIComponent(value)}`
+      );
+      assert.equal(result.status, 400, `cursor=${value.slice(0, 12)}`);
+      assert.equal(typeof result.body.error, "string");
+    }
+  });
+});
+
+test("a cursor cannot be replayed without its exact filter parameters", async () => {
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 6);
+    const stamp = events[0].occurredAt;
+    const page = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=${encodeURIComponent(stamp)}&limit=2`
+    );
+    const cursor = page.body.nextCursor;
+
+    const mismatches = [
+      `/events?limit=2&cursor=${encodeURIComponent(cursor)}`,
+      `/events?from=${encodeURIComponent(stamp)}&limit=3&cursor=${encodeURIComponent(cursor)}`,
+      `/events?from=2000-01-01T00:00:00.000Z&limit=2&cursor=${encodeURIComponent(cursor)}`,
+      `/events?from=${encodeURIComponent(stamp)}&to=2999-01-01T00:00:00.000Z&limit=2&cursor=${encodeURIComponent(cursor)}`
+    ];
+
+    for (const suffix of mismatches) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}${suffix}`);
+      assert.equal(result.status, 400, suffix);
+      assert.equal(typeof result.body.error, "string");
+    }
+
+    const matched = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=${encodeURIComponent(stamp)}&limit=2&cursor=${encodeURIComponent(cursor)}`
+    );
+    assert.equal(matched.status, 200);
+    assert.deepEqual(
+      matched.body.events.map(event => event.sequence),
+      [3, 4]
+    );
+  });
+});
+
+test("a cursor from another scenario returns 400", async () => {
+  await withServer(async baseUrl => {
+    const first = await createScenarioWithEvents(baseUrl, 3, "First");
+    const second = await createScenarioWithEvents(baseUrl, 3, "Second");
+
+    const page = await requestJson(baseUrl, `/scenarios/${first.id}/events?limit=1`);
+    const cursor = page.body.nextCursor;
+
+    const reused = await requestJson(
+      baseUrl,
+      `/scenarios/${second.id}/events?limit=1&cursor=${encodeURIComponent(cursor)}`
+    );
+    assert.equal(reused.status, 400);
+    assert.equal(typeof reused.body.error, "string");
+
+    const randomSid = encodeURIComponent(randomUUID());
+    const unknown = await requestJson(baseUrl, `/scenarios/${randomSid}/events`);
+    assert.equal(unknown.status, 404);
+  });
+});
+
+test("cursors are invalidated after a write changes the revision", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 4);
+
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=2`);
+    assert.equal(typeof page.body.nextCursor, "string");
+
+    const appended = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "late" })
+    });
+    assert.equal(appended.status, 201);
+
+    const stale = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=2&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(stale.status, 400);
+    assert.equal(typeof stale.body.error, "string");
+
+    // The revision reflects the write, and paging restarts from the beginning.
+    const restarted = await requestJson(baseUrl, `/scenarios/${id}/events?limit=2`);
+    assert.equal(restarted.body.revision, 5);
+    assert.deepEqual(
+      restarted.body.events.map(event => event.sequence),
+      [1, 2]
+    );
+  });
+});
+
+test("failed event-list requests do not mutate revision or events", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 2);
+
+    const badRequests = [
+      "/events?limit=0",
+      "/events?limit=101",
+      "/events?from=nonsense",
+      "/events?to=2024-02-30T00:00:00.000Z",
+      "/events?from=2024-02-01T00:00:00.000Z&to=2024-01-01T00:00:00.000Z",
+      "/events?limit=1&limit=2",
+      "/events?cursor=tampered"
+    ];
+    for (const suffix of badRequests) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}${suffix}`);
+      assert.equal(result.status, 400, suffix);
+    }
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 2);
+    assert.equal(scenario.events.length, 2);
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(fetched.body.revision, 2);
+    assert.equal(fetched.body.events.length, 2);
+  }, createApp(store));
+});
+
+test("successful event-list requests do not mutate revision or events", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 5);
+
+    await fetchAllEventPages(baseUrl, id, "?limit=2");
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 5);
+    assert.equal(scenario.events.length, 5);
+    assert.deepEqual(scenario.events, events);
+  }, createApp(store));
+});
+
+test("paged event objects match the create-event response shape", async () => {
+  await withServer(async baseUrl => {
+    const { id } = await createScenarioWithEvents(baseUrl, 3, "Shape");
+    const created = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "shape", payload: { a: 1, nested: { b: true } } })
+    });
+
+    const { events: seen } = await fetchAllEventPages(baseUrl, id, "?limit=2");
+    assert.equal(seen.length, 4);
+    const lastEvent = seen.find(event => event.sequence === 4);
+    assert.deepEqual(lastEvent, created.body);
+    for (const event of seen) {
+      assert.deepEqual(Object.keys(event).sort(), ["id", "occurredAt", "payload", "sequence", "type"]);
+    }
   });
 });
