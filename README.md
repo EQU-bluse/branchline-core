@@ -27,6 +27,7 @@ npm test
 - `GET /scenarios` lists all scenarios in creation order.
 - `GET /scenarios/:id` returns one scenario, or a JSON `404` if it does not exist.
 - `POST /scenarios/:id/events` appends an event (`type` required, `payload` optional object), increments the scenario `revision`, and returns `201` with the event.
+- `GET /scenarios/:id/events` reads the timeline in `sequence` order. Optional query parameters: `from`/`to` (closed interval, UTC `YYYY-MM-DDTHH:mm:ss.SSSZ`), `limit` (1–100, default 50), and `cursor` from a previous page's `nextCursor`. Returns `200` with `{ revision, events, nextCursor }` (`nextCursor` is `null` when no results remain). Follow-up requests must repeat the same `from`, `to`, and `limit`; a stale, foreign, or mismatched cursor returns a JSON `400`.
 - Malformed or invalid JSON requests return a JSON `400` without writing any data.
 - Unknown routes return JSON with status `404`.
 

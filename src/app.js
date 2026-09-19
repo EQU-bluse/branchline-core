@@ -23,6 +23,43 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
 
+const TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+function parseTimestamp(value) {
+  if (typeof value !== "string" || !TIMESTAMP_PATTERN.test(value)) {
+    return null;
+  }
+  const time = Date.parse(value);
+  if (Number.isNaN(time) || new Date(time).toISOString() !== value) {
+    return null;
+  }
+  return time;
+}
+
+function encodeCursor(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function decodeCursor(raw) {
+  let value;
+  try {
+    value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(value)) {
+    return null;
+  }
+  const valid =
+    typeof value.scenarioId === "string" &&
+    Number.isInteger(value.revision) &&
+    Number.isInteger(value.afterSequence) &&
+    Number.isInteger(value.limit) &&
+    (value.from === null || typeof value.from === "string") &&
+    (value.to === null || typeof value.to === "string");
+  return valid ? value : null;
+}
+
 export function createScenarioStore() {
   return { scenarios: new Map() };
 }
@@ -118,6 +155,117 @@ export function createApp(store = createScenarioStore()) {
     sendJson(response, 200, scenario);
   }
 
+  function listEvents(response, id, url) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const allowedParams = new Set(["from", "to", "limit", "cursor"]);
+    const params = {};
+    for (const name of allowedParams) {
+      const values = url.searchParams.getAll(name);
+      if (values.length > 1) {
+        badRequest(response, `Query parameter "${name}" must appear at most once`);
+        return;
+      }
+      params[name] = values.length === 1 ? values[0] : undefined;
+    }
+    for (const name of url.searchParams.keys()) {
+      if (!allowedParams.has(name)) {
+        badRequest(response, `Unknown query parameter "${name}"`);
+        return;
+      }
+    }
+
+    let fromTime = null;
+    if (params.from !== undefined) {
+      fromTime = parseTimestamp(params.from);
+      if (fromTime === null) {
+        badRequest(response, "from must match YYYY-MM-DDTHH:mm:ss.SSSZ and be a real date");
+        return;
+      }
+    }
+    let toTime = null;
+    if (params.to !== undefined) {
+      toTime = parseTimestamp(params.to);
+      if (toTime === null) {
+        badRequest(response, "to must match YYYY-MM-DDTHH:mm:ss.SSSZ and be a real date");
+        return;
+      }
+    }
+    if (fromTime !== null && toTime !== null && toTime < fromTime) {
+      badRequest(response, "to must not be earlier than from");
+      return;
+    }
+
+    let limit = 50;
+    if (params.limit !== undefined) {
+      if (!/^\d+$/.test(params.limit)) {
+        badRequest(response, "limit must be a decimal integer between 1 and 100");
+        return;
+      }
+      limit = Number(params.limit);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        badRequest(response, "limit must be a decimal integer between 1 and 100");
+        return;
+      }
+    }
+
+    let afterSequence = 0;
+    if (params.cursor !== undefined) {
+      const cursor = decodeCursor(params.cursor);
+      if (cursor === null) {
+        badRequest(response, "cursor is not valid");
+        return;
+      }
+      if (cursor.scenarioId !== id) {
+        badRequest(response, "cursor does not belong to this scenario");
+        return;
+      }
+      if (cursor.revision !== scenario.revision) {
+        badRequest(response, "scenario has changed since the cursor was issued");
+        return;
+      }
+      if (cursor.from !== (params.from ?? null) ||
+          cursor.to !== (params.to ?? null) ||
+          cursor.limit !== limit) {
+        badRequest(response, "cursor does not match the given from, to and limit");
+        return;
+      }
+      afterSequence = cursor.afterSequence;
+    }
+
+    const matched = scenario.events.filter(event => {
+      if (event.sequence <= afterSequence) {
+        return false;
+      }
+      const occurredAt = Date.parse(event.occurredAt);
+      if (fromTime !== null && occurredAt < fromTime) {
+        return false;
+      }
+      if (toTime !== null && occurredAt > toTime) {
+        return false;
+      }
+      return true;
+    });
+
+    const events = matched.slice(0, limit);
+    const nextCursor = matched.length > limit
+      ? encodeCursor({
+          scenarioId: id,
+          revision: scenario.revision,
+          from: params.from ?? null,
+          to: params.to ?? null,
+          limit,
+          afterSequence: events[events.length - 1].sequence
+        })
+      : null;
+
+    sendJson(response, 200, { revision: scenario.revision, events, nextCursor });
+  }
+
   async function appendEvent(request, response, id) {
     const scenario = store.scenarios.get(id);
     if (!scenario) {
@@ -182,6 +330,10 @@ export function createApp(store = createScenarioStore()) {
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {
         const id = decodeURIComponent(segments[2]);
+        if (request.method === "GET") {
+          listEvents(response, id, url);
+          return;
+        }
         if (request.method === "POST") {
           await appendEvent(request, response, id);
           return;
