@@ -179,6 +179,59 @@ export function createApp(store = createScenarioStore()) {
     sendJson(response, 201, scenario);
   }
 
+  async function createBranch(request, response, parentId) {
+    const parent = store.scenarios.get(parentId);
+    if (!parent) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const body = await readJsonObject(request, response);
+    if (body === null) {
+      return;
+    }
+
+    if (!isNonEmptyString(body.name)) {
+      badRequest(response, "name must be a non-empty string");
+      return;
+    }
+    if (body.description !== undefined && typeof body.description !== "string") {
+      badRequest(response, "description must be a string");
+      return;
+    }
+    if (!Number.isInteger(body.fromRevision)) {
+      badRequest(response, "fromRevision must be a decimal integer");
+      return;
+    }
+    const fromRevision = body.fromRevision;
+    if (fromRevision < 0 || fromRevision > parent.revision) {
+      badRequest(
+        response,
+        `fromRevision must be between 0 and the scenario's current revision (${parent.revision})`
+      );
+      return;
+    }
+
+    // Deep-copy the historical prefix so later writes to either scenario can
+    // never alias through a shared event or payload object.
+    const events = parent.events
+      .slice(0, fromRevision)
+      .map(event => structuredClone(event));
+
+    const branch = {
+      id: randomUUID(),
+      name: body.name,
+      description: body.description ?? "",
+      revision: fromRevision,
+      events,
+      createdAt: new Date().toISOString(),
+      parentScenarioId: parent.id,
+      parentRevision: parent.revision
+    };
+    store.scenarios.set(branch.id, branch);
+    sendJson(response, 201, branch);
+  }
+
   function listScenarios(response) {
     sendJson(response, 200, [...store.scenarios.values()]);
   }
@@ -410,14 +463,20 @@ export function createApp(store = createScenarioStore()) {
           getScenario(response, id);
           return;
         }
-      } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {
+      } else if (segments.length === 4 && segments[1] === "scenarios"
+        && (segments[3] === "events" || segments[3] === "branches")) {
         const id = decodeURIComponent(segments[2]);
-        if (request.method === "POST") {
-          await appendEvent(request, response, id);
-          return;
-        }
-        if (request.method === "GET") {
-          listEvents(response, id, url);
+        if (segments[3] === "events") {
+          if (request.method === "POST") {
+            await appendEvent(request, response, id);
+            return;
+          }
+          if (request.method === "GET") {
+            listEvents(response, id, url);
+            return;
+          }
+        } else if (request.method === "POST") {
+          await createBranch(request, response, id);
           return;
         }
       }

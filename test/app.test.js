@@ -1087,3 +1087,412 @@ test("explicit occurredAt monotonicity is enforced per scenario", async () => {
     assert.equal(fetchedB.body.events.length, 1);
   });
 });
+
+async function createParentWithEvents(baseUrl, count, name = "Parent") {
+  const created = await requestJson(baseUrl, "/scenarios", {
+    method: "POST",
+    body: JSON.stringify({ name })
+  });
+  assert.equal(created.status, 201);
+  const parentId = created.body.id;
+  const events = [];
+  for (let index = 0; index < count; index += 1) {
+    const result = await requestJson(baseUrl, `/scenarios/${parentId}/events`, {
+      method: "POST",
+      body: JSON.stringify({
+        type: `event-${index + 1}`,
+        payload: { index },
+        occurredAt: `2024-01-01T00:00:${String(index).padStart(2, "0")}.000Z`
+      })
+    });
+    assert.equal(result.status, 201);
+    events.push(result.body);
+  }
+  return { parentId, events };
+}
+
+test("POST branches copies the historical prefix with identical event values", async () => {
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 5);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Fork", description: "at rev 3", fromRevision: 3 })
+    });
+    assert.equal(branched.status, 201);
+    const branch = branched.body;
+
+    assert.notEqual(branch.id, parentId);
+    assert.equal(typeof branch.id, "string");
+    assert.ok(branch.id.length > 0);
+    assert.equal(branch.name, "Fork");
+    assert.equal(branch.description, "at rev 3");
+    assert.equal(branch.revision, 3);
+    assert.equal(branch.parentScenarioId, parentId);
+    assert.equal(branch.parentRevision, 5);
+    assert.equal(typeof branch.createdAt, "string");
+    assert.ok(!Number.isNaN(Date.parse(branch.createdAt)));
+
+    assert.deepEqual(branch.events, events.slice(0, 3));
+    assert.deepEqual(
+      branch.events.map(event => event.sequence),
+      [1, 2, 3]
+    );
+
+    // The branch is readable through the existing scenario and event queries.
+    const fetched = await requestJson(baseUrl, `/scenarios/${branch.id}`);
+    assert.equal(fetched.status, 200);
+    assert.deepEqual(fetched.body, branch);
+
+    const listed = await requestJson(baseUrl, `/scenarios/${branch.id}/events`);
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.revision, 3);
+    assert.deepEqual(listed.body.events, events.slice(0, 3));
+    assert.equal(listed.body.nextCursor, null);
+  });
+});
+
+test("a branch at revision 0 starts with an empty history", async () => {
+  await withServer(async baseUrl => {
+    const { parentId } = await createParentWithEvents(baseUrl, 3);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Empty fork", fromRevision: 0 })
+    });
+    assert.equal(branched.status, 201);
+    assert.equal(branched.body.revision, 0);
+    assert.deepEqual(branched.body.events, []);
+    assert.equal(branched.body.parentScenarioId, parentId);
+    assert.equal(branched.body.parentRevision, 3);
+
+    const listed = await requestJson(baseUrl, `/scenarios/${branched.body.id}/events`);
+    assert.equal(listed.status, 200);
+    assert.equal(listed.body.revision, 0);
+    assert.deepEqual(listed.body.events, []);
+    assert.equal(listed.body.nextCursor, null);
+  });
+});
+
+test("a branch at the current revision copies the whole history", async () => {
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 4);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Full fork", fromRevision: 4 })
+    });
+    assert.equal(branched.status, 201);
+    assert.equal(branched.body.revision, 4);
+    assert.equal(branched.body.parentRevision, 4);
+    assert.deepEqual(branched.body.events, events);
+  });
+});
+
+test("branch description is optional and defaults to an empty string", async () => {
+  await withServer(async baseUrl => {
+    const { parentId } = await createParentWithEvents(baseUrl, 1);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "No description", fromRevision: 1 })
+    });
+    assert.equal(branched.status, 201);
+    assert.equal(branched.body.description, "");
+  });
+});
+
+test("appending to a branch continues sequence after the prefix and stays isolated", async () => {
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 3);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Fork", fromRevision: 2 })
+    });
+    const branchId = branched.body.id;
+
+    const added = await requestJson(baseUrl, `/scenarios/${branchId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "branch-event", payload: { side: true } })
+    });
+    assert.equal(added.status, 201);
+    assert.equal(added.body.sequence, 3);
+    assert.equal(added.body.type, "branch-event");
+
+    const branchView = await requestJson(baseUrl, `/scenarios/${branchId}`);
+    assert.equal(branchView.body.revision, 3);
+    assert.deepEqual(
+      branchView.body.events.map(event => event.sequence),
+      [1, 2, 3]
+    );
+    assert.deepEqual(branchView.body.events.slice(0, 2), events.slice(0, 2));
+    assert.equal(branchView.body.events[2].type, "branch-event");
+
+    // The parent is untouched.
+    const parentView = await requestJson(baseUrl, `/scenarios/${parentId}`);
+    assert.equal(parentView.body.revision, 3);
+    assert.deepEqual(parentView.body.events, events);
+  });
+});
+
+test("later writes to the parent or sibling branches never alter a created branch", async () => {
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 4);
+
+    const forkA = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "A", fromRevision: 2 })
+    });
+    const forkB = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "B", fromRevision: 4 })
+    });
+    assert.equal(forkA.status, 201);
+    assert.equal(forkB.status, 201);
+
+    // Mutate the parent and both siblings after the branches exist.
+    for (const id of [parentId, forkA.body.id, forkB.body.id]) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type: "divergence" })
+      });
+      assert.equal(result.status, 201);
+    }
+
+    const viewA = await requestJson(baseUrl, `/scenarios/${forkA.body.id}`);
+    assert.equal(viewA.body.revision, 3);
+    assert.equal(viewA.body.parentRevision, 4);
+    assert.deepEqual(
+      viewA.body.events.map(event => event.sequence),
+      [1, 2, 3]
+    );
+    assert.deepEqual(viewA.body.events.slice(0, 2), events.slice(0, 2));
+    assert.equal(viewA.body.events[2].type, "divergence");
+
+    const viewB = await requestJson(baseUrl, `/scenarios/${forkB.body.id}`);
+    assert.equal(viewB.body.revision, 5);
+    assert.equal(viewB.body.parentRevision, 4);
+    assert.deepEqual(
+      viewB.body.events.map(event => event.sequence),
+      [1, 2, 3, 4, 5]
+    );
+    assert.deepEqual(viewB.body.events.slice(0, 4), events);
+
+    const parentView = await requestJson(baseUrl, `/scenarios/${parentId}`);
+    assert.equal(parentView.body.revision, 5);
+    assert.deepEqual(
+      parentView.body.events.map(event => event.type),
+      ["event-1", "event-2", "event-3", "event-4", "divergence"]
+    );
+  });
+});
+
+test("branch history events are independent copies of the parent history", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 2);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Copy", fromRevision: 2 })
+    });
+    assert.equal(branched.status, 201);
+    const branchId = branched.body.id;
+
+    const parent = store.scenarios.get(parentId);
+    const branch = store.scenarios.get(branchId);
+    assert.notStrictEqual(branch.events[0], parent.events[0]);
+    assert.notStrictEqual(branch.events[0].payload, parent.events[0].payload);
+    assert.deepEqual(branch.events, events);
+
+    // Mutating the parent's in-memory history cannot leak into the branch.
+    parent.events[0].payload.tampered = true;
+    parent.events.push({ tampered: true });
+    assert.deepEqual(store.scenarios.get(branchId).events, events);
+  }, createApp(store));
+});
+
+test("creating a branch does not invalidate the parent's pagination cursors", async () => {
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 5);
+
+    const page = await requestJson(baseUrl, `/scenarios/${parentId}/events?limit=2`);
+    assert.equal(page.status, 200);
+    assert.equal(typeof page.body.nextCursor, "string");
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Fork", fromRevision: 2 })
+    });
+    assert.equal(branched.status, 201);
+
+    const next = await requestJson(
+      baseUrl,
+      `/scenarios/${parentId}/events?limit=2&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(next.status, 200);
+    assert.deepEqual(
+      next.body.events.map(event => event.sequence),
+      [3, 4]
+    );
+
+    const parentView = await requestJson(baseUrl, `/scenarios/${parentId}`);
+    assert.equal(parentView.body.revision, 5);
+    assert.deepEqual(parentView.body.events, events);
+  });
+});
+
+test("branch events support the existing pagination and range filters", async () => {
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 6);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Fork", fromRevision: 4 })
+    });
+    const branchId = branched.body.id;
+
+    const { events: seen, pages } = await fetchAllEventPages(baseUrl, branchId, "?limit=2");
+    assert.equal(pages, 2);
+    assert.deepEqual(seen, events.slice(0, 4));
+
+    const ranged = await requestJson(
+      baseUrl,
+      `/scenarios/${branchId}/events?from=${encodeURIComponent(events[1].occurredAt)}&to=${encodeURIComponent(events[2].occurredAt)}`
+    );
+    assert.equal(ranged.status, 200);
+    assert.deepEqual(
+      ranged.body.events.map(event => event.sequence),
+      [2, 3]
+    );
+
+    // A parent cursor cannot be replayed against the branch and vice versa.
+    const parentPage = await requestJson(baseUrl, `/scenarios/${parentId}/events?limit=2`);
+    const crossUsed = await requestJson(
+      baseUrl,
+      `/scenarios/${branchId}/events?limit=2&cursor=${encodeURIComponent(parentPage.body.nextCursor)}`
+    );
+    assert.equal(crossUsed.status, 400);
+  });
+});
+
+test("explicit occurredAt on a branch is checked against the prefix's last event", async () => {
+  await withServer(async baseUrl => {
+    const { parentId } = await createParentWithEvents(baseUrl, 2);
+
+    const branched = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Fork", fromRevision: 2 })
+    });
+    const branchId = branched.body.id;
+
+    const earlier = await requestJson(baseUrl, `/scenarios/${branchId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "late", occurredAt: "2023-12-31T23:59:59.999Z" })
+    });
+    assert.equal(earlier.status, 400);
+    assert.equal(earlier.body.error, "bad_request");
+
+    const equal = await requestJson(baseUrl, `/scenarios/${branchId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "equal", occurredAt: "2024-01-01T00:00:01.000Z" })
+    });
+    assert.equal(equal.status, 201);
+    assert.equal(equal.body.sequence, 3);
+
+    const view = await requestJson(baseUrl, `/scenarios/${branchId}`);
+    assert.equal(view.body.revision, 3);
+  });
+});
+
+test("branching from an unknown scenario returns 404 JSON", async () => {
+  await withServer(async baseUrl => {
+    const result = await requestJson(baseUrl, "/scenarios/does-not-exist/branches", {
+      method: "POST",
+      body: JSON.stringify({ name: "Orphan", fromRevision: 0 })
+    });
+    assert.equal(result.status, 404);
+    assert.deepEqual(result.body, { error: "not_found", message: "Scenario not found" });
+
+    const list = await requestJson(baseUrl, "/scenarios");
+    assert.deepEqual(list.body, []);
+  });
+});
+
+test("invalid branch requests return 400 and create nothing", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const { parentId } = await createParentWithEvents(baseUrl, 3);
+    const before = (await requestJson(baseUrl, "/scenarios")).body.length;
+
+    const cases = [
+      ["", undefined, "empty body"],
+      ["{", "application/json", "malformed JSON"],
+      ["not json", "application/json", "non-JSON body"],
+      ["[]", "application/json", "JSON array body"],
+      ["null", "application/json", "JSON null body"],
+      ["42", "application/json", "JSON number body"],
+      [JSON.stringify({ name: "x", fromRevision: 0 }), "text/plain", "wrong media type"],
+      [JSON.stringify({ description: "no name", fromRevision: 0 }), "application/json", "missing name"],
+      [JSON.stringify({ name: "", fromRevision: 0 }), "application/json", "empty name"],
+      [JSON.stringify({ name: 5, fromRevision: 0 }), "application/json", "non-string name"],
+      [JSON.stringify({ name: null, fromRevision: 0 }), "application/json", "null name"],
+      [JSON.stringify({ name: "x", description: 1, fromRevision: 0 }), "application/json", "non-string description"],
+      [JSON.stringify({ name: "x" }), "application/json", "missing fromRevision"],
+      [JSON.stringify({ name: "x", fromRevision: null }), "application/json", "null fromRevision"],
+      [JSON.stringify({ name: "x", fromRevision: "2" }), "application/json", "string fromRevision"],
+      [JSON.stringify({ name: "x", fromRevision: 2.5 }), "application/json", "fractional fromRevision"],
+      [JSON.stringify({ name: "x", fromRevision: true }), "application/json", "boolean fromRevision"],
+      [JSON.stringify({ name: "x", fromRevision: -1 }), "application/json", "negative fromRevision"],
+      [JSON.stringify({ name: "x", fromRevision: 4 }), "application/json", "fromRevision above current revision"],
+      [JSON.stringify({ name: "x", fromRevision: 9007199254740993 }), "application/json", "fromRevision wildly above revision"]
+    ];
+
+    for (const [body, contentType, label] of cases) {
+      const result = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+        method: "POST",
+        contentType,
+        body
+      });
+      assert.equal(result.status, 400, label);
+      assert.equal(typeof result.body.error, "string", label);
+    }
+
+    // No branch was created and the parent is unchanged.
+    const after = await requestJson(baseUrl, "/scenarios");
+    assert.equal(after.body.length, before);
+    const parent = store.scenarios.get(parentId);
+    assert.equal(parent.revision, 3);
+    assert.equal(parent.events.length, 3);
+    assert.equal(parent.parentScenarioId, undefined);
+  }, createApp(store));
+});
+
+test("a failed branch request does not affect other branches or the parent", async () => {
+  await withServer(async baseUrl => {
+    const { parentId, events } = await createParentWithEvents(baseUrl, 3);
+    const existing = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Existing", fromRevision: 1 })
+    });
+    assert.equal(existing.status, 201);
+
+    const invalid = await requestJson(baseUrl, `/scenarios/${parentId}/branches`, {
+      method: "POST",
+      body: JSON.stringify({ name: "Nope", fromRevision: 99 })
+    });
+    assert.equal(invalid.status, 400);
+
+    const list = await requestJson(baseUrl, "/scenarios");
+    assert.equal(list.body.length, 2);
+
+    const existingView = await requestJson(baseUrl, `/scenarios/${existing.body.id}`);
+    assert.equal(existingView.body.revision, 1);
+    assert.deepEqual(existingView.body.events, events.slice(0, 1));
+
+    const parentView = await requestJson(baseUrl, `/scenarios/${parentId}`);
+    assert.equal(parentView.body.revision, 3);
+    assert.deepEqual(parentView.body.events, events);
+  });
+});
