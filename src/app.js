@@ -179,6 +179,50 @@ export function createApp(store = createScenarioStore()) {
     sendJson(response, 201, scenario);
   }
 
+  async function createBranch(request, response, parentId) {
+    const parent = store.scenarios.get(parentId);
+    if (!parent) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const body = await readJsonObject(request, response);
+    if (body === null) {
+      return;
+    }
+
+    if (!isNonEmptyString(body.name)) {
+      badRequest(response, "name must be a non-empty string");
+      return;
+    }
+    if (body.description !== undefined && typeof body.description !== "string") {
+      badRequest(response, "description must be a string");
+      return;
+    }
+    if (typeof body.fromRevision !== "number" || !Number.isInteger(body.fromRevision)) {
+      badRequest(response, "fromRevision must be a decimal integer between 0 and the parent scenario's current revision");
+      return;
+    }
+    if (body.fromRevision < 0 || body.fromRevision > parent.revision) {
+      badRequest(response, "fromRevision must be between 0 and the parent scenario's current revision");
+      return;
+    }
+
+    const fromRevision = body.fromRevision;
+    const branch = {
+      id: randomUUID(),
+      name: body.name,
+      description: body.description ?? "",
+      revision: fromRevision,
+      events: structuredClone(parent.events.slice(0, fromRevision)),
+      createdAt: new Date().toISOString(),
+      parentScenarioId: parent.id,
+      parentRevision: fromRevision
+    };
+    store.scenarios.set(branch.id, branch);
+    sendJson(response, 201, branch);
+  }
+
   function listScenarios(response) {
     sendJson(response, 200, [...store.scenarios.values()]);
   }
@@ -408,6 +452,12 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "GET") {
           getScenario(response, id);
+          return;
+        }
+      } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "branches") {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "POST") {
+          await createBranch(request, response, id);
           return;
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {
