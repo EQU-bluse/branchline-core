@@ -2723,3 +2723,478 @@ test("replay diff is read-only for both scenarios including cursors and clocks",
     assert.equal(store.clocks.get(against.id), "2031-01-01T00:00:00.000Z");
   }, createApp(store));
 });
+
+function explainPath(id, ruleId, sourceSequence) {
+  return `/scenarios/${id}/replay/explain?ruleId=${encodeURIComponent(ruleId)}&sourceSequence=${sourceSequence}`;
+}
+
+test("replay explain returns the full result, source event, rule, and root-only ancestry", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Explain" })
+    });
+    const id = created.body.id;
+
+    const stamps = ["2024-04-01T00:00:00.000Z", "2024-04-02T00:00:00.000Z"];
+    const events = [];
+    for (const [index, type] of ["alpha", "beta"].entries()) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type, payload: { index }, occurredAt: stamps[index] })
+      });
+      assert.equal(result.status, 201);
+      events.push(result.body);
+    }
+
+    const rule = await postRule(baseUrl, id, {
+      name: "Alpha rule",
+      when: { type: "alpha" },
+      then: { type: "one", payload: { n: 1 } }
+    });
+    assert.equal(rule.status, 201);
+
+    const explained = await requestJson(baseUrl, explainPath(id, rule.body.id, 1));
+    assert.equal(explained.status, 200);
+    assert.deepEqual(explained.body, {
+      scenarioId: id,
+      revision: 2,
+      result: {
+        ruleId: rule.body.id,
+        sourceSequence: 1,
+        type: "one",
+        payload: { n: 1 },
+        occurredAt: stamps[0]
+      },
+      event: events[0],
+      rule: rule.body,
+      ancestry: [{ scenarioId: id, parentScenarioId: null, parentRevision: null }]
+    });
+    assert.deepEqual(Object.keys(explained.body).sort(), [
+      "ancestry",
+      "event",
+      "result",
+      "revision",
+      "rule",
+      "scenarioId"
+    ]);
+
+    // The explained result is exactly the corresponding replay result.
+    const replay = await requestJson(baseUrl, `/scenarios/${id}/replay`);
+    assert.equal(replay.status, 200);
+    assert.deepEqual(
+      replay.body.results.find(
+        result => result.ruleId === rule.body.id && result.sourceSequence === 1
+      ),
+      explained.body.result
+    );
+  });
+});
+
+test("replay explain works for a rule without a then.payload (payload defaults to {})", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Explain payload default" })
+    });
+    const id = created.body.id;
+
+    const appended = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" })
+    });
+    assert.equal(appended.status, 201);
+
+    const rule = await postRule(baseUrl, id, {
+      name: "No payload",
+      when: { type: "alpha" },
+      then: { type: "one" }
+    });
+
+    const explained = await requestJson(baseUrl, explainPath(id, rule.body.id, 1));
+    assert.equal(explained.status, 200);
+    assert.deepEqual(explained.body.result, {
+      ruleId: rule.body.id,
+      sourceSequence: 1,
+      type: "one",
+      payload: {},
+      occurredAt: "2024-04-01T00:00:00.000Z"
+    });
+    assert.equal(explained.body.revision, 1);
+  });
+});
+
+test("replay explain lists ancestry from the current scenario through each branch to the root", async () => {
+  await withServer(async baseUrl => {
+    const { id: rootId, events } = await createScenarioWithEvents(baseUrl, 4, "Root");
+
+    const first = await branchAt(baseUrl, rootId, { name: "First fork", fromRevision: 3 });
+    assert.equal(first.status, 201);
+    const firstId = first.body.id;
+
+    const second = await branchAt(baseUrl, firstId, { name: "Second fork", fromRevision: 1 });
+    assert.equal(second.status, 201);
+    const secondId = second.body.id;
+
+    const ruleOnSecond = await postRule(baseUrl, secondId, {
+      name: "Deep rule",
+      when: { type: "event-1" },
+      then: { type: "deep-out" }
+    });
+    assert.equal(ruleOnSecond.status, 201);
+
+    const explained = await requestJson(baseUrl, explainPath(secondId, ruleOnSecond.body.id, 1));
+    assert.equal(explained.status, 200);
+    assert.equal(explained.body.scenarioId, secondId);
+    assert.equal(explained.body.revision, 1);
+    assert.deepEqual(explained.body.event, events[0]);
+    assert.deepEqual(explained.body.rule, ruleOnSecond.body);
+    assert.deepEqual(explained.body.result, {
+      ruleId: ruleOnSecond.body.id,
+      sourceSequence: 1,
+      type: "deep-out",
+      payload: {},
+      occurredAt: events[0].occurredAt
+    });
+    assert.deepEqual(explained.body.ancestry, [
+      { scenarioId: secondId, parentScenarioId: firstId, parentRevision: 1 },
+      { scenarioId: firstId, parentScenarioId: rootId, parentRevision: 3 },
+      { scenarioId: rootId, parentScenarioId: null, parentRevision: null }
+    ]);
+
+    // A rule on the first-level branch explains there with a two-entry ancestry.
+    const ruleOnFirst = await postRule(baseUrl, firstId, {
+      name: "Mid rule",
+      when: { type: "event-2" },
+      then: { type: "mid-out" }
+    });
+    const midExplained = await requestJson(baseUrl, explainPath(firstId, ruleOnFirst.body.id, 2));
+    assert.equal(midExplained.status, 200);
+    assert.deepEqual(midExplained.body.ancestry, [
+      { scenarioId: firstId, parentScenarioId: rootId, parentRevision: 3 },
+      { scenarioId: rootId, parentScenarioId: null, parentRevision: null }
+    ]);
+  });
+});
+
+test("replay explain on a branch does not use rules belonging to the parent or siblings", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Rule isolation" })
+    });
+    const parentId = created.body.id;
+
+    const appended = await requestJson(baseUrl, `/scenarios/${parentId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "alpha", occurredAt: "2024-08-01T00:00:00.000Z" })
+    });
+    assert.equal(appended.status, 201);
+
+    const parentRule = await postRule(baseUrl, parentId, {
+      name: "Parent rule",
+      when: { type: "alpha" },
+      then: { type: "parent-out" }
+    });
+    assert.equal(parentRule.status, 201);
+
+    const branch = await branchAt(baseUrl, parentId, { name: "Fork", fromRevision: 1 });
+    assert.equal(branch.status, 201);
+    const branchId = branch.body.id;
+
+    // The parent's rule id is not a rule of the branch, even though the branch
+    // copied the matching event.
+    const usingParentRule = await requestJson(
+      baseUrl,
+      explainPath(branchId, parentRule.body.id, 1)
+    );
+    assert.equal(usingParentRule.status, 400);
+    assert.equal(usingParentRule.body.error, "bad_request");
+
+    // Once the branch owns an equivalent rule, explanation succeeds.
+    const branchRule = await postRule(baseUrl, branchId, {
+      name: "Branch rule",
+      when: { type: "alpha" },
+      then: { type: "branch-out" }
+    });
+    const explained = await requestJson(baseUrl, explainPath(branchId, branchRule.body.id, 1));
+    assert.equal(explained.status, 200);
+    assert.equal(explained.body.result.type, "branch-out");
+  });
+});
+
+test("replay explain returns 400 when the rule does not match the source event", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "No match" })
+    });
+    const id = created.body.id;
+
+    for (const type of ["alpha", "beta"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type, occurredAt: "2024-04-01T00:00:00.000Z" })
+      });
+      assert.equal(result.status, 201);
+    }
+
+    const alphaRule = await postRule(baseUrl, id, {
+      name: "Alpha only",
+      when: { type: "alpha" },
+      then: { type: "one" }
+    });
+    assert.equal(alphaRule.status, 201);
+
+    // Rule and event both exist, but when.type differs from the event type.
+    const mismatched = await requestJson(baseUrl, explainPath(id, alphaRule.body.id, 2));
+    assert.equal(mismatched.status, 400);
+    assert.equal(mismatched.body.error, "bad_request");
+    assert.equal(typeof mismatched.body.message, "string");
+
+    // It still works for the matching event.
+    const matched = await requestJson(baseUrl, explainPath(id, alphaRule.body.id, 1));
+    assert.equal(matched.status, 200);
+  });
+});
+
+test("replay explain returns 400 for an unknown rule or an event sequence that does not exist", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Missing pieces" })
+    });
+    const id = created.body.id;
+
+    const appended = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" })
+    });
+    assert.equal(appended.status, 201);
+
+    const rule = await postRule(baseUrl, id, {
+      name: "R",
+      when: { type: "alpha" },
+      then: { type: "one" }
+    });
+
+    // A syntactically valid id that belongs to no rule of this scenario.
+    const unknownRule = await requestJson(baseUrl, explainPath(id, randomUUID(), 1));
+    assert.equal(unknownRule.status, 400);
+    assert.equal(unknownRule.body.error, "bad_request");
+
+    // A sequence past the current events.
+    const pastEnd = await requestJson(baseUrl, explainPath(id, rule.body.id, 2));
+    assert.equal(pastEnd.status, 400);
+    assert.equal(pastEnd.body.error, "bad_request");
+
+    // A rule id of a rule in another scenario is unknown here.
+    const other = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Other" })
+    });
+    const otherRule = await postRule(baseUrl, other.body.id, {
+      name: "Other R",
+      when: { type: "alpha" },
+      then: { type: "two" }
+    });
+    const foreignRule = await requestJson(baseUrl, explainPath(id, otherRule.body.id, 1));
+    assert.equal(foreignRule.status, 400);
+    assert.equal(foreignRule.body.error, "bad_request");
+  });
+});
+
+test("replay explain validates ruleId and sourceSequence query parameters", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Validated explain" })
+    });
+    const id = created.body.id;
+
+    const appended = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" })
+    });
+    assert.equal(appended.status, 201);
+    const rule = await postRule(baseUrl, id, {
+      name: "R",
+      when: { type: "alpha" },
+      then: { type: "one" }
+    });
+    const ruleId = encodeURIComponent(rule.body.id);
+
+    const badQueries = [
+      "",
+      "?sourceSequence=1",
+      `?ruleId=${ruleId}`,
+      "?ruleId=&sourceSequence=1",
+      `?ruleId=${ruleId}&sourceSequence=`,
+      `?ruleId=${ruleId}&ruleId=${ruleId}&sourceSequence=1`,
+      `?ruleId=${ruleId}&sourceSequence=1&sourceSequence=2`,
+      `?ruleId=${ruleId}&sourceSequence=0`,
+      `?ruleId=${ruleId}&sourceSequence=-1`,
+      `?ruleId=${ruleId}&sourceSequence=1.5`,
+      `?ruleId=${ruleId}&sourceSequence=1e2`,
+      `?ruleId=${ruleId}&sourceSequence=%2B1`,
+      `?ruleId=${ruleId}&sourceSequence=%201`,
+      `?ruleId=${ruleId}&sourceSequence=1%20`,
+      `?ruleId=${ruleId}&sourceSequence=abc`,
+      `?ruleId=${ruleId}&sourceSequence=NaN`,
+      `?ruleId=${ruleId}&sourceSequence=Infinity`,
+      `?ruleId=${ruleId}&sourceSequence=0x1`,
+      `?ruleId=${ruleId}&sourceSequence=99999999999999999999`,
+      `?ruleId=${ruleId}&sourceSequence=1&bogus=1`,
+      "?bogus=1"
+    ];
+
+    for (const query of badQueries) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/replay/explain${query}`);
+      assert.equal(result.status, 400, query);
+      assert.equal(result.body.error, "bad_request", query);
+      assert.equal(typeof result.body.message, "string", query);
+    }
+
+    // A positive decimal integer with leading zero digits is still a decimal integer.
+    const accepted = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/replay/explain?ruleId=${ruleId}&sourceSequence=01`
+    );
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.body.result.sourceSequence, 1);
+  });
+});
+
+test("replay explain returns the existing 404 for an unknown scenario, before parameter checks", async () => {
+  await withServer(async baseUrl => {
+    const missing = await requestJson(
+      baseUrl,
+      `/scenarios/${randomUUID()}/replay/explain?ruleId=x&sourceSequence=1`
+    );
+    assert.equal(missing.status, 404);
+    assert.deepEqual(missing.body, { error: "not_found", message: "Scenario not found" });
+
+    // Unknown-scenario lookup takes precedence over malformed parameters.
+    const badParams = await requestJson(baseUrl, "/scenarios/missing/replay/explain?bogus=1");
+    assert.equal(badParams.status, 404);
+    assert.equal(badParams.body.error, "not_found");
+
+    const noParams = await requestJson(baseUrl, "/scenarios/missing/replay/explain");
+    assert.equal(noParams.status, 404);
+    assert.equal(noParams.body.error, "not_found");
+  });
+});
+
+test("replay explain is read-only across successful, failing, and repeated requests", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Read-only explain" })
+    });
+    const rootId = created.body.id;
+
+    const stamps = ["2024-04-01T00:00:00.000Z", "2024-04-02T00:00:00.000Z", "2024-04-03T00:00:00.000Z"];
+    for (const [index, type] of ["alpha", "beta", "alpha"].entries()) {
+      const result = await requestJson(baseUrl, `/scenarios/${rootId}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type, occurredAt: stamps[index] })
+      });
+      assert.equal(result.status, 201);
+    }
+
+    const rule = await postRule(baseUrl, rootId, {
+      name: "Alpha rule",
+      when: { type: "alpha" },
+      then: { type: "one", payload: { n: 1 } }
+    });
+    const otherRule = await postRule(baseUrl, rootId, {
+      name: "Beta rule",
+      when: { type: "beta" },
+      then: { type: "two" }
+    });
+
+    const branch = await branchAt(baseUrl, rootId, { name: "Fork", fromRevision: 2 });
+    assert.equal(branch.status, 201);
+    const branchId = branch.body.id;
+    const branchRule = await postRule(baseUrl, branchId, {
+      name: "Branch alpha",
+      when: { type: "alpha" },
+      then: { type: "branch-out" }
+    });
+
+    // A cursor and clock exist on the root before any explain call.
+    const page = await requestJson(baseUrl, `/scenarios/${rootId}/events?limit=2`);
+    assert.equal(page.status, 200);
+    assert.equal(typeof page.body.nextCursor, "string");
+    await setClock(baseUrl, rootId, { currentTime: "2030-01-01T00:00:00.000Z" });
+
+    const rootBefore = await requestJson(baseUrl, `/scenarios/${rootId}`);
+    const branchBefore = await requestJson(baseUrl, `/scenarios/${branchId}`);
+    const rulesBefore = await requestJson(baseUrl, `/scenarios/${rootId}/rules`);
+    const replayBefore = await requestJson(baseUrl, `/scenarios/${rootId}/replay`);
+
+    // Successful requests, repeated.
+    const explained = await requestJson(baseUrl, explainPath(rootId, rule.body.id, 1));
+    assert.equal(explained.status, 200);
+    const explainedAgain = await requestJson(baseUrl, explainPath(rootId, rule.body.id, 3));
+    assert.equal(explainedAgain.status, 200);
+    const explainedRepeat = await requestJson(baseUrl, explainPath(rootId, rule.body.id, 1));
+    assert.deepEqual(explainedRepeat.body, explained.body);
+    const branchExplained = await requestJson(
+      baseUrl,
+      explainPath(branchId, branchRule.body.id, 1)
+    );
+    assert.equal(branchExplained.status, 200);
+
+    // Failing requests: mismatch, unknown rule, missing event, bad parameters.
+    const failures = [
+      explainPath(rootId, rule.body.id, 2),
+      explainPath(rootId, randomUUID(), 1),
+      explainPath(rootId, rule.body.id, 99),
+      explainPath(rootId, otherRule.body.id, 1),
+      `/scenarios/${rootId}/replay/explain`,
+      `/scenarios/${rootId}/replay/explain?ruleId=${encodeURIComponent(rule.body.id)}&sourceSequence=0`,
+      `/scenarios/${rootId}/replay/explain?ruleId=${encodeURIComponent(rule.body.id)}&sourceSequence=1&bogus=1`
+    ];
+    for (const path of failures) {
+      const result = await requestJson(baseUrl, path);
+      assert.ok(result.status === 400, path);
+    }
+
+    // Nothing about the scenarios, rules, clocks, or replay output changed.
+    const rootAfter = await requestJson(baseUrl, `/scenarios/${rootId}`);
+    const branchAfter = await requestJson(baseUrl, `/scenarios/${branchId}`);
+    assert.deepEqual(rootAfter.body, rootBefore.body);
+    assert.deepEqual(branchAfter.body, branchBefore.body);
+
+    const rulesAfter = await requestJson(baseUrl, `/scenarios/${rootId}/rules`);
+    assert.deepEqual(rulesAfter.body, rulesBefore.body);
+    const replayAfter = await requestJson(baseUrl, `/scenarios/${rootId}/replay`);
+    assert.deepEqual(replayAfter.body, replayBefore.body);
+
+    const clock = await requestJson(baseUrl, `/scenarios/${rootId}/clock`);
+    assert.deepEqual(clock.body, { scenarioId: rootId, currentTime: "2030-01-01T00:00:00.000Z" });
+
+    // The earlier cursor still pages identically.
+    const followed = await requestJson(
+      baseUrl,
+      `/scenarios/${rootId}/events?limit=2&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(followed.status, 200);
+    assert.deepEqual(
+      followed.body.events.map(event => event.sequence),
+      [3]
+    );
+    assert.equal(followed.body.nextCursor, null);
+
+    assert.equal(store.scenarios.get(rootId).revision, 3);
+    assert.equal(store.scenarios.get(rootId).events.length, 3);
+    assert.equal(store.scenarios.get(branchId).revision, 2);
+    assert.equal(store.scenarios.get(branchId).events.length, 2);
+    assert.equal(store.rules.get(rootId).length, 2);
+    assert.equal(store.rules.get(branchId).length, 1);
+    assert.equal(store.clocks.get(rootId), "2030-01-01T00:00:00.000Z");
+    assert.equal(store.clocks.get(branchId), undefined);
+  }, createApp(store));
+});

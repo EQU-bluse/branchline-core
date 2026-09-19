@@ -6,6 +6,7 @@ const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const DECIMAL_INTEGER_PATTERN = /^\d+$/;
 const EVENT_QUERY_PARAMS = new Set(["from", "to", "limit", "cursor"]);
 const REPLAY_DIFF_QUERY_PARAMS = new Set(["against"]);
+const REPLAY_EXPLAIN_QUERY_PARAMS = new Set(["ruleId", "sourceSequence"]);
 const DEFAULT_EVENTS_LIMIT = 50;
 const MAX_EVENTS_LIMIT = 100;
 
@@ -428,13 +429,7 @@ export function createApp(store = createScenarioStore()) {
         if (rule.when.type !== event.type) {
           continue;
         }
-        results.push({
-          ruleId: rule.id,
-          sourceSequence: event.sequence,
-          type: rule.then.type,
-          payload: rule.then.payload ?? {},
-          occurredAt: event.occurredAt
-        });
+        results.push(buildReplayResult(rule, event));
       }
     }
     return results;
@@ -562,6 +557,109 @@ export function createApp(store = createScenarioStore()) {
       againstRevision: againstScenario.revision,
       added,
       removed
+    });
+  }
+
+  function buildReplayResult(rule, event) {
+    return {
+      ruleId: rule.id,
+      sourceSequence: event.sequence,
+      type: rule.then.type,
+      payload: rule.then.payload ?? {},
+      occurredAt: event.occurredAt
+    };
+  }
+
+  // Lists the branch chain from the given scenario up to the root. The root
+  // scenario is the only entry with null parent fields.
+  function buildAncestry(scenarioId) {
+    const ancestry = [];
+    let currentId = scenarioId;
+    for (;;) {
+      const current = store.scenarios.get(currentId);
+      if (current.parentScenarioId === undefined) {
+        ancestry.push({
+          scenarioId: current.id,
+          parentScenarioId: null,
+          parentRevision: null
+        });
+        return ancestry;
+      }
+      ancestry.push({
+        scenarioId: current.id,
+        parentScenarioId: current.parentScenarioId,
+        parentRevision: current.parentRevision
+      });
+      currentId = current.parentScenarioId;
+    }
+  }
+
+  function replayExplain(response, id, url) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const paramKeys = new Set(url.searchParams.keys());
+    for (const key of paramKeys) {
+      if (!REPLAY_EXPLAIN_QUERY_PARAMS.has(key)) {
+        badRequest(response, `Unknown query parameter: ${key}`);
+        return;
+      }
+    }
+
+    const ruleIdValues = url.searchParams.getAll("ruleId");
+    if (ruleIdValues.length !== 1) {
+      badRequest(response, "ruleId must appear exactly once");
+      return;
+    }
+    const ruleId = ruleIdValues[0];
+    if (!isNonEmptyString(ruleId)) {
+      badRequest(response, "ruleId must not be empty");
+      return;
+    }
+
+    const sequenceValues = url.searchParams.getAll("sourceSequence");
+    if (sequenceValues.length !== 1) {
+      badRequest(response, "sourceSequence must appear exactly once");
+      return;
+    }
+    const rawSequence = sequenceValues[0];
+    if (!DECIMAL_INTEGER_PATTERN.test(rawSequence) || !Number.isSafeInteger(Number(rawSequence))) {
+      badRequest(response, "sourceSequence must be a positive decimal integer");
+      return;
+    }
+    const sourceSequence = Number(rawSequence);
+    if (sourceSequence < 1) {
+      badRequest(response, "sourceSequence must be a positive decimal integer");
+      return;
+    }
+
+    const rule = (store.rules.get(id) ?? []).find(candidate => candidate.id === ruleId);
+    if (rule === undefined) {
+      badRequest(response, "Rule not found in this scenario");
+      return;
+    }
+
+    const event = scenario.events[sourceSequence - 1];
+    if (event === undefined || event.sequence !== sourceSequence) {
+      badRequest(response, "Event not found in this scenario");
+      return;
+    }
+
+    if (rule.when.type !== event.type) {
+      badRequest(response, "Rule does not match the source event");
+      return;
+    }
+
+    sendJson(response, 200, {
+      scenarioId: id,
+      revision: scenario.revision,
+      result: buildReplayResult(rule, event),
+      event,
+      rule,
+      ancestry: buildAncestry(id)
     });
   }
 
@@ -774,6 +872,17 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "GET") {
           replayDiff(response, id, url);
+          return;
+        }
+      } else if (
+        segments.length === 5
+        && segments[1] === "scenarios"
+        && segments[3] === "replay"
+        && segments[4] === "explain"
+      ) {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "GET") {
+          replayExplain(response, id, url);
           return;
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {
