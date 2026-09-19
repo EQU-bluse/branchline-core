@@ -98,7 +98,7 @@ function isNonEmptyString(value) {
 }
 
 export function createScenarioStore() {
-  return { scenarios: new Map(), clocks: new Map() };
+  return { scenarios: new Map(), clocks: new Map(), rules: new Map() };
 }
 
 export function createApp(store = createScenarioStore()) {
@@ -259,7 +259,17 @@ export function createApp(store = createScenarioStore()) {
 
     let occurredAt;
     if (body.occurredAt === undefined) {
-      occurredAt = store.clocks.get(id) ?? new Date().toISOString();
+      const clock = store.clocks.get(id);
+      if (clock !== undefined) {
+        const last = scenario.events[scenario.events.length - 1];
+        if (last !== undefined && Date.parse(clock) < Date.parse(last.occurredAt)) {
+          badRequest(response, "the scenario clock is earlier than the last event's occurredAt; advance the clock or pass an explicit occurredAt");
+          return;
+        }
+        occurredAt = clock;
+      } else {
+        occurredAt = new Date().toISOString();
+      }
     } else {
       const parsed = parseUtcTimestamp(body.occurredAt);
       if (parsed === null) {
@@ -329,6 +339,116 @@ export function createApp(store = createScenarioStore()) {
       return;
     }
     sendJson(response, 200, { scenarioId: id, currentTime: store.clocks.get(id) ?? null });
+  }
+
+  function scenarioRules(id) {
+    let rules = store.rules.get(id);
+    if (rules === undefined) {
+      rules = [];
+      store.rules.set(id, rules);
+    }
+    return rules;
+  }
+
+  async function createRule(request, response, id) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const body = await readJsonObject(request, response);
+    if (body === null) {
+      return;
+    }
+
+    for (const key of Object.keys(body)) {
+      if (key !== "name" && key !== "when" && key !== "then") {
+        badRequest(response, `Unknown field: ${key}`);
+        return;
+      }
+    }
+    if (!isNonEmptyString(body.name)) {
+      badRequest(response, "name must be a non-empty string");
+      return;
+    }
+    if (!isPlainObject(body.when)) {
+      badRequest(response, "when must be a JSON object");
+      return;
+    }
+    for (const key of Object.keys(body.when)) {
+      if (key !== "type") {
+        badRequest(response, `Unknown field in when: ${key}`);
+        return;
+      }
+    }
+    if (!isNonEmptyString(body.when.type)) {
+      badRequest(response, "when.type must be a non-empty string");
+      return;
+    }
+    if (!isPlainObject(body.then)) {
+      badRequest(response, "then must be a JSON object");
+      return;
+    }
+    for (const key of Object.keys(body.then)) {
+      if (key !== "type" && key !== "payload") {
+        badRequest(response, `Unknown field in then: ${key}`);
+        return;
+      }
+    }
+    if (!isNonEmptyString(body.then.type)) {
+      badRequest(response, "then.type must be a non-empty string");
+      return;
+    }
+    if (body.then.payload !== undefined && !isPlainObject(body.then.payload)) {
+      badRequest(response, "then.payload must be a JSON object");
+      return;
+    }
+
+    const rule = {
+      id: randomUUID(),
+      name: body.name,
+      when: { type: body.when.type },
+      then: { type: body.then.type, payload: body.then.payload ?? {} }
+    };
+    scenarioRules(id).push(rule);
+    sendJson(response, 201, rule);
+  }
+
+  function listRules(response, id) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+    sendJson(response, 200, scenarioRules(id));
+  }
+
+  function replayScenario(response, id) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const rules = scenarioRules(id);
+    const results = [];
+    for (const event of scenario.events) {
+      for (const rule of rules) {
+        if (rule.when.type !== event.type) {
+          continue;
+        }
+        results.push({
+          ruleId: rule.id,
+          sourceSequence: event.sequence,
+          type: rule.then.type,
+          payload: rule.then.payload,
+          occurredAt: event.occurredAt
+        });
+      }
+    }
+
+    sendJson(response, 200, { revision: scenario.revision, results });
   }
 
   function readSingleParam(url, name) {
@@ -523,6 +643,22 @@ export function createApp(store = createScenarioStore()) {
         }
         if (request.method === "GET") {
           listEvents(response, id, url);
+          return;
+        }
+      } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "rules") {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "POST") {
+          await createRule(request, response, id);
+          return;
+        }
+        if (request.method === "GET") {
+          listRules(response, id);
+          return;
+        }
+      } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "replay") {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "GET") {
+          replayScenario(response, id);
           return;
         }
       }
