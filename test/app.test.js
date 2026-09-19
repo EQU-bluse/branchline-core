@@ -2292,3 +2292,434 @@ test("the stale-clock boundary is enforced per scenario including branches", asy
     assert.equal(parentAppended.body.sequence, 3);
   });
 });
+
+async function createReplayScenario(baseUrl, name, events, rules) {
+  const created = await requestJson(baseUrl, "/scenarios", {
+    method: "POST",
+    body: JSON.stringify({ name })
+  });
+  assert.equal(created.status, 201);
+  const id = created.body.id;
+
+  for (const event of events) {
+    const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify(event)
+    });
+    assert.equal(result.status, 201);
+  }
+
+  const storedRules = [];
+  for (const rule of rules) {
+    const result = await postRule(baseUrl, id, rule);
+    assert.equal(result.status, 201);
+    storedRules.push(result.body);
+  }
+
+  return { id, rules: storedRules };
+}
+
+function replayDiffPath(currentId, againstId) {
+  return `/scenarios/${currentId}/replay/diff?against=${encodeURIComponent(againstId)}`;
+}
+
+test("replay diff of identical results reports no added or removed results", async () => {
+  await withServer(async baseUrl => {
+    const events = [
+      { type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" },
+      { type: "beta", occurredAt: "2024-04-02T00:00:00.000Z" }
+    ];
+    const rules = [
+      { name: "R", when: { type: "alpha" }, then: { type: "one", payload: { n: 1 } } },
+      { name: "S", when: { type: "beta" }, then: { type: "two" } }
+    ];
+    const current = await createReplayScenario(baseUrl, "Current", events, rules);
+    const against = await createReplayScenario(baseUrl, "Against", events, rules);
+
+    const diff = await requestJson(baseUrl, replayDiffPath(current.id, against.id));
+    assert.equal(diff.status, 200);
+    // Different rule ids on each side still cancel: ruleId is not part of the key.
+    assert.notEqual(current.rules[0].id, against.rules[0].id);
+    assert.deepEqual(diff.body, {
+      scenarioId: current.id,
+      revision: 2,
+      againstScenarioId: against.id,
+      againstRevision: 2,
+      added: [],
+      removed: []
+    });
+
+    // Comparing a scenario with itself also yields an empty diff.
+    const selfDiff = await requestJson(baseUrl, replayDiffPath(current.id, current.id));
+    assert.equal(selfDiff.status, 200);
+    assert.deepEqual(selfDiff.body, {
+      scenarioId: current.id,
+      revision: 2,
+      againstScenarioId: current.id,
+      againstRevision: 2,
+      added: [],
+      removed: []
+    });
+  });
+});
+
+test("replay diff cancels duplicate results one occurrence at a time", async () => {
+  await withServer(async baseUrl => {
+    const events = [{ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" }];
+    const current = await createReplayScenario(baseUrl, "Current", events, [
+      { name: "dup-1", when: { type: "alpha" }, then: { type: "dup", payload: { n: 1 } } },
+      { name: "dup-2", when: { type: "alpha" }, then: { type: "dup", payload: { n: 1 } } },
+      { name: "only-current", when: { type: "alpha" }, then: { type: "only-a" } }
+    ]);
+    const against = await createReplayScenario(baseUrl, "Against", events, [
+      { name: "dup-1", when: { type: "alpha" }, then: { type: "dup", payload: { n: 1 } } },
+      { name: "only-against", when: { type: "alpha" }, then: { type: "only-b" } }
+    ]);
+
+    const diff = await requestJson(baseUrl, replayDiffPath(current.id, against.id));
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.revision, 1);
+    assert.equal(diff.body.againstRevision, 1);
+    assert.equal(diff.body.added.length, 2);
+    assert.equal(diff.body.removed.length, 1);
+
+    // One of the two duplicate occurrences survives, followed by the current-only result,
+    // each keeping its original replay position and full fields.
+    assert.deepEqual(diff.body.added[0], {
+      ruleId: current.rules[1].id,
+      sourceSequence: 1,
+      type: "dup",
+      payload: { n: 1 },
+      occurredAt: "2024-04-01T00:00:00.000Z"
+    });
+    assert.deepEqual(diff.body.added[1], {
+      ruleId: current.rules[2].id,
+      sourceSequence: 1,
+      type: "only-a",
+      payload: {},
+      occurredAt: "2024-04-01T00:00:00.000Z"
+    });
+    assert.deepEqual(diff.body.removed[0], {
+      ruleId: against.rules[1].id,
+      sourceSequence: 1,
+      type: "only-b",
+      payload: {},
+      occurredAt: "2024-04-01T00:00:00.000Z"
+    });
+
+    // The reverse direction keeps the extra duplicate on the removed side, in order.
+    const reverse = await requestJson(baseUrl, replayDiffPath(against.id, current.id));
+    assert.equal(reverse.status, 200);
+    assert.deepEqual(reverse.body.added, [
+      {
+        ruleId: against.rules[1].id,
+        sourceSequence: 1,
+        type: "only-b",
+        payload: {},
+        occurredAt: "2024-04-01T00:00:00.000Z"
+      }
+    ]);
+    assert.deepEqual(reverse.body.removed.map(result => result.type), ["dup", "only-a"]);
+    assert.equal(reverse.body.removed[0].ruleId, current.rules[1].id);
+    assert.equal(reverse.body.removed[1].ruleId, current.rules[2].id);
+  });
+});
+
+test("replay diff compares payloads structurally regardless of object field order", async () => {
+  await withServer(async baseUrl => {
+    const events = [{ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" }];
+    const current = await createReplayScenario(baseUrl, "Current", events, [
+      {
+        name: "reordered",
+        when: { type: "alpha" },
+        then: { type: "same", payload: { a: 1, nested: { x: 1, y: 2 } } }
+      },
+      { name: "different-value", when: { type: "alpha" }, then: { type: "other", payload: { n: 1 } } }
+    ]);
+    const against = await createReplayScenario(baseUrl, "Against", events, [
+      {
+        name: "reordered",
+        when: { type: "alpha" },
+        then: { type: "same", payload: { nested: { y: 2, x: 1 }, a: 1 } }
+      },
+      { name: "different-value", when: { type: "alpha" }, then: { type: "other", payload: { n: "1" } } }
+    ]);
+
+    const diff = await requestJson(baseUrl, replayDiffPath(current.id, against.id));
+    assert.equal(diff.status, 200);
+    // The reordered payload cancels; only the structurally different payload remains.
+    assert.deepEqual(diff.body.added, [
+      {
+        ruleId: current.rules[1].id,
+        sourceSequence: 1,
+        type: "other",
+        payload: { n: 1 },
+        occurredAt: "2024-04-01T00:00:00.000Z"
+      }
+    ]);
+    assert.deepEqual(diff.body.removed, [
+      {
+        ruleId: against.rules[1].id,
+        sourceSequence: 1,
+        type: "other",
+        payload: { n: "1" },
+        occurredAt: "2024-04-01T00:00:00.000Z"
+      }
+    ]);
+  });
+});
+
+test("replay diff reports a symmetric bidirectional difference", async () => {
+  await withServer(async baseUrl => {
+    const current = await createReplayScenario(
+      baseUrl,
+      "Current",
+      [
+        { type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" },
+        { type: "beta", occurredAt: "2024-04-02T00:00:00.000Z" }
+      ],
+      [
+        { name: "alpha-rule", when: { type: "alpha" }, then: { type: "one", payload: { n: 1 } } },
+        { name: "beta-rule", when: { type: "beta" }, then: { type: "two" } }
+      ]
+    );
+    const against = await createReplayScenario(
+      baseUrl,
+      "Against",
+      [
+        { type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" },
+        { type: "gamma", occurredAt: "2024-04-03T00:00:00.000Z" }
+      ],
+      [
+        { name: "alpha-rule", when: { type: "alpha" }, then: { type: "one", payload: { n: 1 } } },
+        { name: "gamma-rule", when: { type: "gamma" }, then: { type: "three", payload: { n: 3 } } }
+      ]
+    );
+
+    const diff = await requestJson(baseUrl, replayDiffPath(current.id, against.id));
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.scenarioId, current.id);
+    assert.equal(diff.body.revision, 2);
+    assert.equal(diff.body.againstScenarioId, against.id);
+    assert.equal(diff.body.againstRevision, 2);
+    assert.deepEqual(diff.body.added, [
+      {
+        ruleId: current.rules[1].id,
+        sourceSequence: 2,
+        type: "two",
+        payload: {},
+        occurredAt: "2024-04-02T00:00:00.000Z"
+      }
+    ]);
+    assert.deepEqual(diff.body.removed, [
+      {
+        ruleId: against.rules[1].id,
+        sourceSequence: 2,
+        type: "three",
+        payload: { n: 3 },
+        occurredAt: "2024-04-03T00:00:00.000Z"
+      }
+    ]);
+    for (const result of [...diff.body.added, ...diff.body.removed]) {
+      assert.deepEqual(Object.keys(result).sort(), [
+        "occurredAt",
+        "payload",
+        "ruleId",
+        "sourceSequence",
+        "type"
+      ]);
+    }
+
+    const reverse = await requestJson(baseUrl, replayDiffPath(against.id, current.id));
+    assert.equal(reverse.status, 200);
+    assert.equal(reverse.body.scenarioId, against.id);
+    assert.equal(reverse.body.againstScenarioId, current.id);
+    assert.deepEqual(reverse.body.added, diff.body.removed);
+    assert.deepEqual(reverse.body.removed, diff.body.added);
+  });
+});
+
+test("replay diff rejects malformed against parameters with a JSON 400", async () => {
+  await withServer(async baseUrl => {
+    const current = await createReplayScenario(
+      baseUrl,
+      "Current",
+      [{ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" }],
+      [{ name: "R", when: { type: "alpha" }, then: { type: "one" } }]
+    );
+    const other = await createReplayScenario(
+      baseUrl,
+      "Other",
+      [{ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" }],
+      [{ name: "R", when: { type: "alpha" }, then: { type: "one" } }]
+    );
+
+    const otherEncoded = encodeURIComponent(other.id);
+    const badQueries = [
+      "",
+      "?against=",
+      `?against=${otherEncoded}&against=${otherEncoded}`,
+      `?against=${otherEncoded}&bogus=1`,
+      "?bogus=1"
+    ];
+
+    for (const query of badQueries) {
+      const result = await requestJson(baseUrl, `/scenarios/${current.id}/replay/diff${query}`);
+      assert.equal(result.status, 400, query);
+      assert.equal(result.body.error, "bad_request", query);
+      assert.equal(typeof result.body.message, "string", query);
+    }
+  });
+});
+
+test("replay diff returns 404 when either scenario is unknown", async () => {
+  await withServer(async baseUrl => {
+    const current = await createReplayScenario(
+      baseUrl,
+      "Current",
+      [{ type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" }],
+      [{ name: "R", when: { type: "alpha" }, then: { type: "one" } }]
+    );
+
+    const missingAgainst = await requestJson(
+      baseUrl,
+      replayDiffPath(current.id, randomUUID())
+    );
+    assert.equal(missingAgainst.status, 404);
+    assert.deepEqual(missingAgainst.body, { error: "not_found", message: "Scenario not found" });
+
+    const missingCurrent = await requestJson(
+      baseUrl,
+      `/scenarios/${randomUUID()}/replay/diff?against=${encodeURIComponent(current.id)}`
+    );
+    assert.equal(missingCurrent.status, 404);
+    assert.deepEqual(missingCurrent.body, { error: "not_found", message: "Scenario not found" });
+
+    const bothMissing = await requestJson(
+      baseUrl,
+      `/scenarios/${randomUUID()}/replay/diff?against=${encodeURIComponent(randomUUID())}`
+    );
+    assert.equal(bothMissing.status, 404);
+    assert.equal(bothMissing.body.error, "not_found");
+
+    // Scenario lookup takes precedence over query validation, matching other endpoints.
+    const precedence = await requestJson(
+      baseUrl,
+      `/scenarios/${randomUUID()}/replay/diff?bogus=1`
+    );
+    assert.equal(precedence.status, 404);
+    assert.equal(precedence.body.error, "not_found");
+  });
+});
+
+test("replay diff is read-only for both scenarios including cursors and clocks", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const current = await createReplayScenario(
+      baseUrl,
+      "Current",
+      [
+        { type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" },
+        { type: "beta", occurredAt: "2024-04-02T00:00:00.000Z" }
+      ],
+      [
+        { name: "R", when: { type: "alpha" }, then: { type: "one", payload: { n: 1 } } },
+        { name: "S", when: { type: "beta" }, then: { type: "two" } }
+      ]
+    );
+    const against = await createReplayScenario(
+      baseUrl,
+      "Against",
+      [
+        { type: "alpha", occurredAt: "2024-04-01T00:00:00.000Z" },
+        { type: "unmatched", occurredAt: "2024-04-03T00:00:00.000Z" }
+      ],
+      [{ name: "R", when: { type: "alpha" }, then: { type: "one", payload: { n: 1 } } }]
+    );
+
+    // Cursors and clocks exist on both sides before the diff.
+    const currentPage = await requestJson(baseUrl, `/scenarios/${current.id}/events?limit=1`);
+    assert.equal(typeof currentPage.body.nextCursor, "string");
+    const againstPage = await requestJson(baseUrl, `/scenarios/${against.id}/events?limit=1`);
+    assert.equal(typeof againstPage.body.nextCursor, "string");
+    await setClock(baseUrl, current.id, { currentTime: "2030-01-01T00:00:00.000Z" });
+    await setClock(baseUrl, against.id, { currentTime: "2031-01-01T00:00:00.000Z" });
+
+    const currentBefore = await requestJson(baseUrl, `/scenarios/${current.id}`);
+    const againstBefore = await requestJson(baseUrl, `/scenarios/${against.id}`);
+    const currentRulesBefore = await requestJson(baseUrl, `/scenarios/${current.id}/rules`);
+    const againstRulesBefore = await requestJson(baseUrl, `/scenarios/${against.id}/rules`);
+
+    const diff = await requestJson(baseUrl, replayDiffPath(current.id, against.id));
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.added.length, 1);
+    assert.equal(diff.body.removed.length, 0);
+
+    // Repeating the exact same read-only query yields identical output.
+    const diffAgain = await requestJson(baseUrl, replayDiffPath(current.id, against.id));
+    assert.deepEqual(diffAgain.body, diff.body);
+
+    // Failing requests must be side-effect free as well.
+    for (const badPath of [
+      `/scenarios/${current.id}/replay/diff`,
+      `/scenarios/${current.id}/replay/diff?against=`,
+      `/scenarios/${current.id}/replay/diff?against=x&against=y`,
+      `/scenarios/${current.id}/replay/diff?against=${encodeURIComponent(randomUUID())}`
+    ]) {
+      const result = await requestJson(baseUrl, badPath);
+      assert.ok(result.status === 400 || result.status === 404, badPath);
+    }
+
+    const currentAfter = await requestJson(baseUrl, `/scenarios/${current.id}`);
+    const againstAfter = await requestJson(baseUrl, `/scenarios/${against.id}`);
+    assert.deepEqual(currentAfter.body, currentBefore.body);
+    assert.deepEqual(againstAfter.body, againstBefore.body);
+
+    const currentRulesAfter = await requestJson(baseUrl, `/scenarios/${current.id}/rules`);
+    const againstRulesAfter = await requestJson(baseUrl, `/scenarios/${against.id}/rules`);
+    assert.deepEqual(currentRulesAfter.body, currentRulesBefore.body);
+    assert.deepEqual(againstRulesAfter.body, againstRulesBefore.body);
+
+    const currentClock = await requestJson(baseUrl, `/scenarios/${current.id}/clock`);
+    const againstClock = await requestJson(baseUrl, `/scenarios/${against.id}/clock`);
+    assert.deepEqual(currentClock.body, {
+      scenarioId: current.id,
+      currentTime: "2030-01-01T00:00:00.000Z"
+    });
+    assert.deepEqual(againstClock.body, {
+      scenarioId: against.id,
+      currentTime: "2031-01-01T00:00:00.000Z"
+    });
+
+    // Cursors issued before the diff remain valid on both scenarios.
+    const currentFollowUp = await requestJson(
+      baseUrl,
+      `/scenarios/${current.id}/events?limit=1&cursor=${encodeURIComponent(currentPage.body.nextCursor)}`
+    );
+    assert.equal(currentFollowUp.status, 200);
+    assert.deepEqual(
+      currentFollowUp.body.events.map(event => event.sequence),
+      [2]
+    );
+    const againstFollowUp = await requestJson(
+      baseUrl,
+      `/scenarios/${against.id}/events?limit=1&cursor=${encodeURIComponent(againstPage.body.nextCursor)}`
+    );
+    assert.equal(againstFollowUp.status, 200);
+    assert.equal(againstFollowUp.body.nextCursor, null);
+
+    // The plain replay endpoint still agrees with the diff's underlying derivation.
+    const currentReplay = await requestJson(baseUrl, `/scenarios/${current.id}/replay`);
+    assert.equal(currentReplay.status, 200);
+    assert.equal(currentReplay.body.results.length, 2);
+
+    assert.equal(store.scenarios.get(current.id).revision, 2);
+    assert.equal(store.scenarios.get(current.id).events.length, 2);
+    assert.equal(store.scenarios.get(against.id).revision, 2);
+    assert.equal(store.scenarios.get(against.id).events.length, 2);
+    assert.equal(store.rules.get(current.id).length, 2);
+    assert.equal(store.rules.get(against.id).length, 1);
+    assert.equal(store.clocks.get(current.id), "2030-01-01T00:00:00.000Z");
+    assert.equal(store.clocks.get(against.id), "2031-01-01T00:00:00.000Z");
+  }, createApp(store));
+});

@@ -5,6 +5,7 @@ const jsonHeaders = { "content-type": "application/json; charset=utf-8" };
 const UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const DECIMAL_INTEGER_PATTERN = /^\d+$/;
 const EVENT_QUERY_PARAMS = new Set(["from", "to", "limit", "cursor"]);
+const REPLAY_DIFF_QUERY_PARAMS = new Set(["against"]);
 const DEFAULT_EVENTS_LIMIT = 50;
 const MAX_EVENTS_LIMIT = 100;
 
@@ -419,14 +420,8 @@ export function createApp(store = createScenarioStore()) {
     sendJson(response, 200, store.rules.get(id) ?? []);
   }
 
-  function replayScenario(response, id) {
-    const scenario = store.scenarios.get(id);
-    if (!scenario) {
-      notFound(response, "Scenario not found");
-      return;
-    }
-
-    const rules = store.rules.get(id) ?? [];
+  function computeReplayResults(scenario) {
+    const rules = store.rules.get(scenario.id) ?? [];
     const results = [];
     for (const event of scenario.events) {
       for (const rule of rules) {
@@ -442,8 +437,132 @@ export function createApp(store = createScenarioStore()) {
         });
       }
     }
+    return results;
+  }
 
+  function replayScenario(response, id) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const results = computeReplayResults(scenario);
     sendJson(response, 200, { revision: scenario.revision, results });
+  }
+
+  function jsonValueEqual(left, right) {
+    if (isPlainObject(left) && isPlainObject(right)) {
+      const leftKeys = Object.keys(left);
+      const rightKeys = Object.keys(right);
+      if (leftKeys.length !== rightKeys.length) {
+        return false;
+      }
+      for (const key of leftKeys) {
+        if (!Object.hasOwn(right, key) || !jsonValueEqual(left[key], right[key])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    if (Array.isArray(left) && Array.isArray(right)) {
+      if (left.length !== right.length) {
+        return false;
+      }
+      for (let index = 0; index < left.length; index += 1) {
+        if (!jsonValueEqual(left[index], right[index])) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return left === right;
+  }
+
+  function replayResultKeyEqual(left, right) {
+    return (
+      left.sourceSequence === right.sourceSequence
+      && left.type === right.type
+      && left.occurredAt === right.occurredAt
+      && jsonValueEqual(left.payload, right.payload)
+    );
+  }
+
+  // Multiset difference keyed on sourceSequence/type/payload/occurredAt
+  // (ruleId is ignored). Survivors keep each side's original replay order,
+  // and equal keys cancel one occurrence at a time.
+  function diffReplayResults(currentResults, againstResults) {
+    const matchedAgainst = new Array(againstResults.length).fill(false);
+    const added = [];
+    for (const current of currentResults) {
+      let index = -1;
+      for (let candidate = 0; candidate < againstResults.length; candidate += 1) {
+        if (!matchedAgainst[candidate] && replayResultKeyEqual(current, againstResults[candidate])) {
+          index = candidate;
+          break;
+        }
+      }
+      if (index === -1) {
+        added.push(current);
+      } else {
+        matchedAgainst[index] = true;
+      }
+    }
+
+    const removed = [];
+    for (let index = 0; index < againstResults.length; index += 1) {
+      if (!matchedAgainst[index]) {
+        removed.push(againstResults[index]);
+      }
+    }
+    return { added, removed };
+  }
+
+  function replayDiff(response, id, url) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const paramKeys = new Set(url.searchParams.keys());
+    for (const key of paramKeys) {
+      if (!REPLAY_DIFF_QUERY_PARAMS.has(key)) {
+        badRequest(response, `Unknown query parameter: ${key}`);
+        return;
+      }
+    }
+
+    const againstValues = url.searchParams.getAll("against");
+    if (againstValues.length !== 1) {
+      badRequest(response, "against must appear exactly once");
+      return;
+    }
+    const againstId = againstValues[0];
+    if (!isNonEmptyString(againstId)) {
+      badRequest(response, "against must be a non-empty string");
+      return;
+    }
+
+    const againstScenario = store.scenarios.get(againstId);
+    if (!againstScenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const { added, removed } = diffReplayResults(
+      computeReplayResults(scenario),
+      computeReplayResults(againstScenario)
+    );
+
+    sendJson(response, 200, {
+      scenarioId: id,
+      revision: scenario.revision,
+      againstScenarioId: againstId,
+      againstRevision: againstScenario.revision,
+      added,
+      removed
+    });
   }
 
   function readSingleParam(url, name) {
@@ -644,6 +763,17 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "GET") {
           replayScenario(response, id);
+          return;
+        }
+      } else if (
+        segments.length === 5
+        && segments[1] === "scenarios"
+        && segments[3] === "replay"
+        && segments[4] === "diff"
+      ) {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "GET") {
+          replayDiff(response, id, url);
           return;
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {
