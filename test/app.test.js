@@ -2292,3 +2292,476 @@ test("the stale-clock boundary is enforced per scenario including branches", asy
     assert.equal(parentAppended.body.sequence, 3);
   });
 });
+
+async function createScenarioWithRule(baseUrl, name, { rule, eventType, occurredAt }) {
+  const created = await requestJson(baseUrl, "/scenarios", {
+    method: "POST",
+    body: JSON.stringify({ name })
+  });
+  assert.equal(created.status, 201);
+  const id = created.body.id;
+
+  const event = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+    method: "POST",
+    body: JSON.stringify({ type: eventType, occurredAt })
+  });
+  assert.equal(event.status, 201);
+
+  const storedRule = await postRule(baseUrl, id, rule);
+  assert.equal(storedRule.status, 201);
+  return { id, event: event.body, rule: storedRule.body };
+}
+
+test("GET replay/diff returns empty sets when both scenarios produce identical results", async () => {
+  await withServer(async baseUrl => {
+    const stamps = ["2024-05-01T00:00:00.000Z", "2024-05-02T00:00:00.000Z"];
+    const left = await createScenarioWithRule(baseUrl, "Left", {
+      eventType: "alpha",
+      occurredAt: stamps[0],
+      rule: { name: "L rule", when: { type: "alpha" }, then: { type: "out", payload: { n: 1 } } }
+    });
+    // A second event leaves replay unchanged (no matching rule).
+    const extra = await requestJson(baseUrl, `/scenarios/${left.id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "unmatched", occurredAt: stamps[1] })
+    });
+    assert.equal(extra.status, 201);
+
+    const right = await createScenarioWithRule(baseUrl, "Right", {
+      eventType: "alpha",
+      occurredAt: stamps[0],
+      rule: { name: "R rule", when: { type: "alpha" }, then: { type: "out", payload: { n: 1 } } }
+    });
+
+    const diff = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/replay/diff?against=${encodeURIComponent(right.id)}`
+    );
+    assert.equal(diff.status, 200);
+    assert.deepEqual(diff.body, {
+      scenarioId: left.id,
+      revision: 2,
+      againstScenarioId: right.id,
+      againstRevision: 1,
+      added: [],
+      removed: []
+    });
+  });
+});
+
+test("GET replay/diff ignores ruleId when comparing results", async () => {
+  await withServer(async baseUrl => {
+    const stamp = "2024-05-03T00:00:00.000Z";
+    const left = await createScenarioWithRule(baseUrl, "Left", {
+      eventType: "alpha",
+      occurredAt: stamp,
+      rule: { name: "A", when: { type: "alpha" }, then: { type: "same" } }
+    });
+    const right = await createScenarioWithRule(baseUrl, "Right", {
+      eventType: "alpha",
+      occurredAt: stamp,
+      rule: { name: "B", when: { type: "alpha" }, then: { type: "same" } }
+    });
+    assert.notEqual(left.rule.id, right.rule.id);
+
+    const diff = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/replay/diff?against=${encodeURIComponent(right.id)}`
+    );
+    assert.equal(diff.status, 200);
+    assert.deepEqual(diff.body.added, []);
+    assert.deepEqual(diff.body.removed, []);
+  });
+});
+
+test("GET replay/diff cancels duplicate results one by one by occurrence count", async () => {
+  await withServer(async baseUrl => {
+    // Two events of the same type at the same time produce duplicate replay
+    // results; duplicates across the sides must offset pairwise.
+    const stamp = "2024-05-04T00:00:00.000Z";
+    async function scenarioWithDuplicates(name, duplicateCount) {
+      const created = await requestJson(baseUrl, "/scenarios", {
+        method: "POST",
+        body: JSON.stringify({ name })
+      });
+      const id = created.body.id;
+      for (let index = 0; index < duplicateCount; index += 1) {
+        const event = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+          method: "POST",
+          body: JSON.stringify({ type: "alpha", occurredAt: stamp })
+        });
+        assert.equal(event.status, 201);
+      }
+      const stored = await postRule(baseUrl, id, {
+        name: `${name} rule`,
+        when: { type: "alpha" },
+        then: { type: "dup", payload: { k: "v" } }
+      });
+      assert.equal(stored.status, 201);
+      return { id, ruleId: stored.body.id, count: duplicateCount };
+    }
+
+    // Left has 3 copies, right has 2: exactly one survives into added.
+    const three = await scenarioWithDuplicates("Three", 3);
+    const two = await scenarioWithDuplicates("Two", 2);
+
+    const leftMore = await requestJson(
+      baseUrl,
+      `/scenarios/${three.id}/replay/diff?against=${encodeURIComponent(two.id)}`
+    );
+    assert.equal(leftMore.status, 200);
+    assert.equal(leftMore.body.added.length, 1);
+    assert.deepEqual(leftMore.body.removed, []);
+    assert.deepEqual(leftMore.body.added[0], {
+      ruleId: three.ruleId,
+      sourceSequence: 3,
+      type: "dup",
+      payload: { k: "v" },
+      occurredAt: stamp
+    });
+
+    // Reverse direction: the unmatched duplicate is removed instead.
+    const rightMore = await requestJson(
+      baseUrl,
+      `/scenarios/${two.id}/replay/diff?against=${encodeURIComponent(three.id)}`
+    );
+    assert.equal(rightMore.status, 200);
+    assert.deepEqual(rightMore.body.added, []);
+    assert.equal(rightMore.body.removed.length, 1);
+    assert.deepEqual(rightMore.body.removed[0], {
+      ruleId: three.ruleId,
+      sourceSequence: 3,
+      type: "dup",
+      payload: { k: "v" },
+      occurredAt: stamp
+    });
+  });
+});
+
+test("GET replay/diff compares payloads structurally regardless of object field order", async () => {
+  await withServer(async baseUrl => {
+    const stamp = "2024-05-05T00:00:00.000Z";
+    const left = await createScenarioWithRule(baseUrl, "Left", {
+      eventType: "alpha",
+      occurredAt: stamp,
+      rule: { name: "L", when: { type: "alpha" }, then: { type: "out", payload: { a: 1, nested: { x: 1, y: 2 } } } }
+    });
+    const reordered = await createScenarioWithRule(baseUrl, "Reordered", {
+      eventType: "alpha",
+      occurredAt: stamp,
+      rule: { name: "M", when: { type: "alpha" }, then: { type: "out", payload: { nested: { y: 2, x: 1 }, a: 1 } } }
+    });
+    const changed = await createScenarioWithRule(baseUrl, "Changed", {
+      eventType: "alpha",
+      occurredAt: stamp,
+      rule: { name: "C", when: { type: "alpha" }, then: { type: "out", payload: { nested: { y: 3, x: 1 }, a: 1 } } }
+    });
+
+    const same = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/replay/diff?against=${encodeURIComponent(reordered.id)}`
+    );
+    assert.equal(same.status, 200);
+    assert.deepEqual(same.body.added, []);
+    assert.deepEqual(same.body.removed, []);
+
+    // A structurally different payload value is a genuine difference.
+    const diff = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/replay/diff?against=${encodeURIComponent(changed.id)}`
+    );
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.added.length, 1);
+    assert.equal(diff.body.removed.length, 1);
+    assert.deepEqual(diff.body.added[0].payload, { a: 1, nested: { x: 1, y: 2 } });
+    assert.deepEqual(diff.body.removed[0].payload, { nested: { y: 3, x: 1 }, a: 1 });
+  });
+});
+
+test("GET replay/diff reports a bidirectional diff keeping each side's replay order", async () => {
+  await withServer(async baseUrl => {
+    async function scenarioFromEvents(name, seeded) {
+      const created = await requestJson(baseUrl, "/scenarios", {
+        method: "POST",
+        body: JSON.stringify({ name })
+      });
+      const id = created.body.id;
+      const sources = [];
+      for (const [index, { type, occurredAt }] of seeded.entries()) {
+        const event = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+          method: "POST",
+          body: JSON.stringify({ type, occurredAt })
+        });
+        assert.equal(event.status, 201);
+        sources.push(event.body);
+      }
+      const rule = await postRule(baseUrl, id, {
+        name: `${name} rule`,
+        when: { type: "alpha" },
+        then: { type: "out" }
+      });
+      assert.equal(rule.status, 201);
+      return { id, ruleId: rule.body.id, sources };
+    }
+
+    const t = day => `2024-06-0${day}T00:00:00.000Z`;
+    // Left replay order (only "alpha" events fire): seqs 1(shared), 2(only-left),
+    // 3(shared), 4(only-left). Right replay order: seqs 1(shared), 3(shared),
+    // 4(only-right).
+    const left = await scenarioFromEvents("Current", [
+      { type: "alpha", occurredAt: t(1) },
+      { type: "alpha", occurredAt: t(2) },
+      { type: "alpha", occurredAt: t(3) },
+      { type: "alpha", occurredAt: t(4) }
+    ]);
+    const right = await scenarioFromEvents("Against", [
+      { type: "alpha", occurredAt: t(1) },
+      { type: "beta", occurredAt: t(2) },
+      { type: "alpha", occurredAt: t(3) },
+      { type: "alpha", occurredAt: t(9) }
+    ]);
+
+    const diff = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/replay/diff?against=${encodeURIComponent(right.id)}`
+    );
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.scenarioId, left.id);
+    assert.equal(diff.body.revision, 4);
+    assert.equal(diff.body.againstScenarioId, right.id);
+    assert.equal(diff.body.againstRevision, 4);
+
+    // Shared occurrences (seq 1 and seq 3 at identical times) cancel, leaving
+    // each side's exclusive results in original replay order.
+    assert.deepEqual(
+      diff.body.added.map(result => [result.ruleId, result.sourceSequence, result.type, result.occurredAt]),
+      [
+        [left.ruleId, 2, "out", t(2)],
+        [left.ruleId, 4, "out", t(4)]
+      ]
+    );
+    assert.deepEqual(
+      diff.body.removed.map(result => [result.ruleId, result.sourceSequence, result.type, result.occurredAt]),
+      [[right.ruleId, 4, "out", t(9)]]
+    );
+
+    // Elements retain the complete replay result fields, including ruleId.
+    for (const result of [...diff.body.added, ...diff.body.removed]) {
+      assert.deepEqual(Object.keys(result).sort(), [
+        "occurredAt",
+        "payload",
+        "ruleId",
+        "sourceSequence",
+        "type"
+      ]);
+      assert.deepEqual(result.payload, {});
+    }
+  });
+});
+
+test("GET replay/diff accepts comparing a scenario against itself", async () => {
+  await withServer(async baseUrl => {
+    const created = await createScenarioWithRule(baseUrl, "Self", {
+      eventType: "alpha",
+      occurredAt: "2024-06-10T00:00:00.000Z",
+      rule: { name: "R", when: { type: "alpha" }, then: { type: "out", payload: { v: 1 } } }
+    });
+
+    const diff = await requestJson(
+      baseUrl,
+      `/scenarios/${created.id}/replay/diff?against=${encodeURIComponent(created.id)}`
+    );
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.scenarioId, created.id);
+    assert.equal(diff.body.againstScenarioId, created.id);
+    assert.equal(diff.body.revision, diff.body.againstRevision);
+    assert.deepEqual(diff.body.added, []);
+    assert.deepEqual(diff.body.removed, []);
+  });
+});
+
+test("GET replay/diff returns 400 for missing, empty, duplicated, or unknown query parameters", async () => {
+  await withServer(async baseUrl => {
+    const first = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "First" })
+    });
+    const second = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Second" })
+    });
+    const id = first.body.id;
+    const other = second.body.id;
+
+    const badRequests = [
+      { label: "missing against", path: `/scenarios/${id}/replay/diff` },
+      { label: "empty against", path: `/scenarios/${id}/replay/diff?against=` },
+      {
+        label: "duplicated against",
+        path: `/scenarios/${id}/replay/diff?against=${encodeURIComponent(other)}&against=${encodeURIComponent(other)}`
+      },
+      {
+        label: "unknown parameter",
+        path: `/scenarios/${id}/replay/diff?against=${encodeURIComponent(other)}&extra=1`
+      },
+      { label: "only unknown parameter", path: `/scenarios/${id}/replay/diff?other=${encodeURIComponent(other)}` }
+    ];
+
+    for (const { label, path } of badRequests) {
+      const result = await requestJson(baseUrl, path);
+      assert.equal(result.status, 400, label);
+      assert.equal(result.body.error, "bad_request", label);
+      assert.equal(typeof result.body.message, "string", label);
+    }
+
+    // A whitespace value is still a non-empty string, so it is treated as an
+    // id lookup that misses rather than as a malformed parameter.
+    const whitespace = await requestJson(baseUrl, `/scenarios/${id}/replay/diff?against=%20%20`);
+    assert.equal(whitespace.status, 404);
+    assert.equal(whitespace.body.error, "not_found");
+  });
+});
+
+test("GET replay/diff returns the existing 404 JSON for an unknown scenario on either side", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Existing" })
+    });
+    const id = created.body.id;
+
+    const unknownCurrent = await requestJson(
+      baseUrl,
+      "/scenarios/missing/replay/diff?against=whatever"
+    );
+    assert.equal(unknownCurrent.status, 404);
+    assert.deepEqual(unknownCurrent.body, { error: "not_found", message: "Scenario not found" });
+
+    const unknownAgainst = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/replay/diff?against=missing`
+    );
+    assert.equal(unknownAgainst.status, 404);
+    assert.deepEqual(unknownAgainst.body, { error: "not_found", message: "Scenario not found" });
+
+    // A syntactically bad request still resolves as 404 when the current
+    // scenario is missing, matching the route's existing 404 precedence.
+    const precedence = await requestJson(baseUrl, "/scenarios/missing/replay/diff");
+    assert.equal(precedence.status, 404);
+    assert.equal(precedence.body.error, "not_found");
+  });
+});
+
+test("GET replay/diff is read-only for revisions, events, rules, clocks, and cursors", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const left = await createScenarioWithEvents(baseUrl, 3, "Left");
+    const right = await createScenarioWithEvents(baseUrl, 2, "Right");
+    await postRule(baseUrl, left.id, { name: "L", when: { type: "event-2" }, then: { type: "left-out" } });
+    await postRule(baseUrl, right.id, { name: "R", when: { type: "event-1" }, then: { type: "right-out" } });
+
+    // Capture a pagination cursor and a clock before the read-only diffs.
+    const page = await requestJson(baseUrl, `/scenarios/${left.id}/events?limit=1`);
+    assert.equal(page.status, 200);
+    assert.equal(typeof page.body.nextCursor, "string");
+    const clock = await setClock(baseUrl, left.id, { currentTime: "2031-01-01T00:00:00.000Z" });
+    assert.equal(clock.status, 200);
+
+    const beforeLeft = await requestJson(baseUrl, `/scenarios/${left.id}`);
+    const beforeRight = await requestJson(baseUrl, `/scenarios/${right.id}`);
+    const leftRules = await requestJson(baseUrl, `/scenarios/${left.id}/rules`);
+    const rightRules = await requestJson(baseUrl, `/scenarios/${right.id}/rules`);
+
+    const diff = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/replay/diff?against=${encodeURIComponent(right.id)}`
+    );
+    assert.equal(diff.status, 200);
+    // Repeating the query, including a failing one, changes nothing.
+    const diffAgain = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/replay/diff?against=${encodeURIComponent(right.id)}`
+    );
+    assert.deepEqual(diffAgain.body, diff.body);
+    const bad = await requestJson(baseUrl, `/scenarios/${left.id}/replay/diff`);
+    assert.equal(bad.status, 400);
+
+    const afterLeft = await requestJson(baseUrl, `/scenarios/${left.id}`);
+    const afterRight = await requestJson(baseUrl, `/scenarios/${right.id}`);
+    assert.deepEqual(afterLeft.body, beforeLeft.body);
+    assert.deepEqual(afterRight.body, beforeRight.body);
+    assert.equal(afterLeft.body.revision, 3);
+    assert.equal(afterRight.body.revision, 2);
+
+    const leftRulesAfter = await requestJson(baseUrl, `/scenarios/${left.id}/rules`);
+    const rightRulesAfter = await requestJson(baseUrl, `/scenarios/${right.id}/rules`);
+    assert.deepEqual(leftRulesAfter.body, leftRules.body);
+    assert.deepEqual(rightRulesAfter.body, rightRules.body);
+
+    const clockAfter = await requestJson(baseUrl, `/scenarios/${left.id}/clock`);
+    assert.deepEqual(clockAfter.body, {
+      scenarioId: left.id,
+      currentTime: "2031-01-01T00:00:00.000Z"
+    });
+
+    const followed = await requestJson(
+      baseUrl,
+      `/scenarios/${left.id}/events?limit=1&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(followed.status, 200);
+    assert.deepEqual(followed.body.events.map(event => event.sequence), [2]);
+
+    const leftScenario = store.scenarios.get(left.id);
+    const rightScenario = store.scenarios.get(right.id);
+    assert.equal(leftScenario.revision, 3);
+    assert.equal(rightScenario.revision, 2);
+    assert.equal(leftScenario.events.length, 3);
+    assert.equal(rightScenario.events.length, 2);
+  }, createApp(store));
+});
+
+test("GET replay/diff stays branch-isolated and reflects each scenario's own replay", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Parent" })
+    });
+    const parentId = created.body.id;
+    for (const type of ["alpha", "beta"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${parentId}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type, occurredAt: "2024-07-01T00:00:00.000Z" })
+      });
+      assert.equal(result.status, 201);
+    }
+    const parentRule = await postRule(baseUrl, parentId, {
+      name: "Parent",
+      when: { type: "alpha" },
+      then: { type: "parent-out" }
+    });
+    assert.equal(parentRule.status, 201);
+
+    const branch = await branchAt(baseUrl, parentId, { name: "Fork", fromRevision: 2 });
+    assert.equal(branch.status, 201);
+    const branchId = branch.body.id;
+    const branchRule = await postRule(baseUrl, branchId, {
+      name: "Branch",
+      when: { type: "alpha" },
+      then: { type: "branch-out" }
+    });
+    assert.equal(branchRule.status, 201);
+
+    const diff = await requestJson(
+      baseUrl,
+      `/scenarios/${branchId}/replay/diff?against=${encodeURIComponent(parentId)}`
+    );
+    assert.equal(diff.status, 200);
+    assert.equal(diff.body.revision, 2);
+    assert.equal(diff.body.againstRevision, 2);
+    // Same source event/time but different output types: no cancellation.
+    assert.deepEqual(diff.body.added.map(result => result.type), ["branch-out"]);
+    assert.deepEqual(diff.body.removed.map(result => result.type), ["parent-out"]);
+    assert.equal(diff.body.added[0].ruleId, branchRule.body.id);
+    assert.equal(diff.body.removed[0].ruleId, parentRule.body.id);
+  });
+});

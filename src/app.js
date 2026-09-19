@@ -97,6 +97,87 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
 
+// Order-independent serialization of a JSON-derived value: objects are compared
+// structurally regardless of key order, while arrays keep their element order.
+function canonicalJson(value) {
+  if (isPlainObject(value)) {
+    const keys = Object.keys(value).sort();
+    return `{${keys.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(element => canonicalJson(element)).join(",")}]`;
+  }
+  return JSON.stringify(value);
+}
+
+function computeReplayResults(scenario, rules) {
+  const results = [];
+  for (const event of scenario.events) {
+    for (const rule of rules) {
+      if (rule.when.type !== event.type) {
+        continue;
+      }
+      results.push({
+        ruleId: rule.id,
+        sourceSequence: event.sequence,
+        type: rule.then.type,
+        payload: rule.then.payload ?? {},
+        occurredAt: event.occurredAt
+      });
+    }
+  }
+  return results;
+}
+
+// Comparison key deliberately excludes ruleId: results that only differ in the
+// rule that produced them are the same replay outcome.
+function replayResultKey(result) {
+  return JSON.stringify([
+    result.sourceSequence,
+    result.type,
+    canonicalJson(result.payload),
+    result.occurredAt
+  ]);
+}
+
+// Pairwise multiset cancellation: duplicate results offset one by one by
+// occurrence count. Surviving elements keep each side's original replay order.
+function diffReplayResults(currentResults, againstResults) {
+  const remainingAgainst = new Map();
+  for (const result of againstResults) {
+    const key = replayResultKey(result);
+    remainingAgainst.set(key, (remainingAgainst.get(key) ?? 0) + 1);
+  }
+  const added = [];
+  for (const result of currentResults) {
+    const key = replayResultKey(result);
+    const count = remainingAgainst.get(key) ?? 0;
+    if (count > 0) {
+      remainingAgainst.set(key, count - 1);
+    } else {
+      added.push(result);
+    }
+  }
+
+  const remainingCurrent = new Map();
+  for (const result of currentResults) {
+    const key = replayResultKey(result);
+    remainingCurrent.set(key, (remainingCurrent.get(key) ?? 0) + 1);
+  }
+  const removed = [];
+  for (const result of againstResults) {
+    const key = replayResultKey(result);
+    const count = remainingCurrent.get(key) ?? 0;
+    if (count > 0) {
+      remainingCurrent.set(key, count - 1);
+    } else {
+      removed.push(result);
+    }
+  }
+
+  return { added, removed };
+}
+
 export function createScenarioStore() {
   return { scenarios: new Map(), clocks: new Map(), rules: new Map() };
 }
@@ -426,24 +507,52 @@ export function createApp(store = createScenarioStore()) {
       return;
     }
 
-    const rules = store.rules.get(id) ?? [];
-    const results = [];
-    for (const event of scenario.events) {
-      for (const rule of rules) {
-        if (rule.when.type !== event.type) {
-          continue;
-        }
-        results.push({
-          ruleId: rule.id,
-          sourceSequence: event.sequence,
-          type: rule.then.type,
-          payload: rule.then.payload ?? {},
-          occurredAt: event.occurredAt
-        });
+    const results = computeReplayResults(scenario, store.rules.get(id) ?? []);
+    sendJson(response, 200, { revision: scenario.revision, results });
+  }
+
+  function replayDiff(response, id, url) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const paramKeys = new Set(url.searchParams.keys());
+    for (const key of paramKeys) {
+      if (key !== "against") {
+        badRequest(response, `Unknown query parameter: ${key}`);
+        return;
       }
     }
 
-    sendJson(response, 200, { revision: scenario.revision, results });
+    const againstValues = url.searchParams.getAll("against");
+    if (againstValues.length !== 1 || againstValues[0] === "") {
+      badRequest(response, "against must appear exactly once as a non-empty string");
+      return;
+    }
+
+    const againstScenario = store.scenarios.get(againstValues[0]);
+    if (!againstScenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const results = computeReplayResults(scenario, store.rules.get(id) ?? []);
+    const againstResults = computeReplayResults(
+      againstScenario,
+      store.rules.get(againstScenario.id) ?? []
+    );
+    const { added, removed } = diffReplayResults(results, againstResults);
+
+    sendJson(response, 200, {
+      scenarioId: id,
+      revision: scenario.revision,
+      againstScenarioId: againstScenario.id,
+      againstRevision: againstScenario.revision,
+      added,
+      removed
+    });
   }
 
   function readSingleParam(url, name) {
@@ -644,6 +753,17 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "GET") {
           replayScenario(response, id);
+          return;
+        }
+      } else if (
+        segments.length === 5
+        && segments[1] === "scenarios"
+        && segments[3] === "replay"
+        && segments[4] === "diff"
+      ) {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "GET") {
+          replayDiff(response, id, url);
           return;
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {
