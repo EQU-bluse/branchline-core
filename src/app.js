@@ -98,7 +98,7 @@ function isNonEmptyString(value) {
 }
 
 export function createScenarioStore() {
-  return { scenarios: new Map() };
+  return { scenarios: new Map(), clocks: new Map() };
 }
 
 export function createApp(store = createScenarioStore()) {
@@ -259,7 +259,7 @@ export function createApp(store = createScenarioStore()) {
 
     let occurredAt;
     if (body.occurredAt === undefined) {
-      occurredAt = new Date().toISOString();
+      occurredAt = store.clocks.get(id) ?? new Date().toISOString();
     } else {
       const parsed = parseUtcTimestamp(body.occurredAt);
       if (parsed === null) {
@@ -284,6 +284,51 @@ export function createApp(store = createScenarioStore()) {
     scenario.events.push(event);
     scenario.revision += 1;
     sendJson(response, 201, event);
+  }
+
+  async function setClock(request, response, id) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const body = await readJsonObject(request, response);
+    if (body === null) {
+      return;
+    }
+
+    if (typeof body.currentTime !== "string") {
+      badRequest(response, "currentTime must be a string formatted as YYYY-MM-DDTHH:mm:ss.SSSZ");
+      return;
+    }
+    const parsed = parseUtcTimestamp(body.currentTime);
+    if (parsed === null) {
+      badRequest(response, "currentTime must be a UTC timestamp formatted as YYYY-MM-DDTHH:mm:ss.SSSZ");
+      return;
+    }
+    const last = scenario.events[scenario.events.length - 1];
+    if (last !== undefined && parsed.getTime() < Date.parse(last.occurredAt)) {
+      badRequest(response, "currentTime must not be earlier than the last event's occurredAt");
+      return;
+    }
+    const existing = store.clocks.get(id);
+    if (existing !== undefined && parsed.getTime() < Date.parse(existing)) {
+      badRequest(response, "currentTime must not be earlier than the current clock time");
+      return;
+    }
+
+    store.clocks.set(id, body.currentTime);
+    sendJson(response, 200, { scenarioId: id, currentTime: body.currentTime });
+  }
+
+  function getClock(response, id) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+    sendJson(response, 200, { scenarioId: id, currentTime: store.clocks.get(id) ?? null });
   }
 
   function readSingleParam(url, name) {
@@ -458,6 +503,16 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "POST") {
           await createBranch(request, response, id);
+          return;
+        }
+      } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "clock") {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "POST") {
+          await setClock(request, response, id);
+          return;
+        }
+        if (request.method === "GET") {
+          getClock(response, id);
           return;
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "events") {

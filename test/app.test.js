@@ -1428,3 +1428,323 @@ test("a failed branch leaves parent cursors and history usable", async () => {
     assert.deepEqual(followed.body.events.map(event => event.sequence), [2]);
   });
 });
+
+async function setClock(baseUrl, id, body, options = {}) {
+  return requestJson(baseUrl, `/scenarios/${id}/clock`, {
+    method: "POST",
+    contentType: options.contentType,
+    body: typeof body === "string" ? body : JSON.stringify(body)
+  });
+}
+
+test("GET clock returns null currentTime before the clock is ever set", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Clockless" })
+    });
+    const id = created.body.id;
+
+    const result = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, { scenarioId: id, currentTime: null });
+  });
+});
+
+test("clock endpoints return the existing 404 JSON for an unknown scenario", async () => {
+  await withServer(async baseUrl => {
+    const got = await requestJson(baseUrl, "/scenarios/missing/clock");
+    assert.equal(got.status, 404);
+    assert.deepEqual(got.body, { error: "not_found", message: "Scenario not found" });
+
+    const posted = await setClock(baseUrl, "missing", { currentTime: "2024-01-01T00:00:00.000Z" });
+    assert.equal(posted.status, 404);
+    assert.deepEqual(posted.body, { error: "not_found", message: "Scenario not found" });
+
+    // The 404 takes precedence over an otherwise invalid body.
+    const invalid = await setClock(baseUrl, "missing", "{");
+    assert.equal(invalid.status, 404);
+    assert.equal(invalid.body.error, "not_found");
+  });
+});
+
+test("the clock can be set, read back, and advanced; equal times are allowed", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Clocked" })
+    });
+    const id = created.body.id;
+
+    const first = await setClock(baseUrl, id, { currentTime: "2024-01-01T00:00:00.000Z" });
+    assert.equal(first.status, 200);
+    assert.deepEqual(first.body, { scenarioId: id, currentTime: "2024-01-01T00:00:00.000Z" });
+
+    const read = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.equal(read.status, 200);
+    assert.deepEqual(read.body, { scenarioId: id, currentTime: "2024-01-01T00:00:00.000Z" });
+
+    const equal = await setClock(baseUrl, id, { currentTime: "2024-01-01T00:00:00.000Z" });
+    assert.equal(equal.status, 200);
+    assert.deepEqual(equal.body, { scenarioId: id, currentTime: "2024-01-01T00:00:00.000Z" });
+
+    const advanced = await setClock(baseUrl, id, { currentTime: "2024-06-15T12:30:00.500Z" });
+    assert.equal(advanced.status, 200);
+    assert.deepEqual(advanced.body, { scenarioId: id, currentTime: "2024-06-15T12:30:00.500Z" });
+
+    const reread = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.deepEqual(reread.body, { scenarioId: id, currentTime: "2024-06-15T12:30:00.500Z" });
+  });
+});
+
+test("a clock earlier than the current clock returns 400 without side effects", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Monotonic clock" })
+    });
+    const id = created.body.id;
+
+    const set = await setClock(baseUrl, id, { currentTime: "2024-06-15T12:00:00.000Z" });
+    assert.equal(set.status, 200);
+
+    for (const currentTime of ["2024-06-15T11:59:59.999Z", "2020-01-01T00:00:00.000Z"]) {
+      const result = await setClock(baseUrl, id, { currentTime });
+      assert.equal(result.status, 400, currentTime);
+      assert.equal(result.body.error, "bad_request");
+    }
+
+    const read = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.deepEqual(read.body, { scenarioId: id, currentTime: "2024-06-15T12:00:00.000Z" });
+  });
+});
+
+test("a clock earlier than the last event occurredAt returns 400 without side effects", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Pinned events" })
+    });
+    const id = created.body.id;
+
+    for (const occurredAt of ["2024-06-01T00:00:00.000Z", "2024-06-03T00:00:00.000Z"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type: "pinned", occurredAt })
+      });
+      assert.equal(result.status, 201);
+    }
+
+    const tooEarly = await setClock(baseUrl, id, { currentTime: "2024-06-02T23:59:59.999Z" });
+    assert.equal(tooEarly.status, 400);
+    assert.equal(tooEarly.body.error, "bad_request");
+
+    // Equal to the last event is allowed.
+    const equal = await setClock(baseUrl, id, { currentTime: "2024-06-03T00:00:00.000Z" });
+    assert.equal(equal.status, 200);
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 2);
+    assert.equal(scenario.events.length, 2);
+    assert.equal(store.clocks.get(id), "2024-06-03T00:00:00.000Z");
+  }, createApp(store));
+});
+
+test("invalid clock requests return 400 and never set the clock", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Guarded clock" })
+    });
+    const id = created.body.id;
+
+    const cases = [
+      ["", undefined, "empty body"],
+      [JSON.stringify({ currentTime: "2024-01-01T00:00:00.000Z" }), "text/plain", "wrong media type"],
+      ["{", "application/json", "malformed JSON"],
+      ["[]", "application/json", "JSON array body"],
+      [JSON.stringify({}), "application/json", "missing currentTime"],
+      [JSON.stringify({ currentTime: 1717171717 }), "application/json", "numeric currentTime"],
+      [JSON.stringify({ currentTime: null }), "application/json", "null currentTime"],
+      [JSON.stringify({ currentTime: true }), "application/json", "boolean currentTime"],
+      [JSON.stringify({ currentTime: {} }), "application/json", "object currentTime"],
+      [JSON.stringify({ currentTime: "" }), "application/json", "empty currentTime"],
+      [JSON.stringify({ currentTime: "2024-01-01T00:00:00Z" }), "application/json", "missing milliseconds"],
+      [JSON.stringify({ currentTime: "2024-01-01T00:00:00.000+00:00" }), "application/json", "offset instead of Z"],
+      [JSON.stringify({ currentTime: "2024-01-01 00:00:00.000Z" }), "application/json", "space separator"],
+      [JSON.stringify({ currentTime: "not-a-date" }), "application/json", "not a date"],
+      [JSON.stringify({ currentTime: "2024-02-30T00:00:00.000Z" }), "application/json", "nonexistent day"],
+      [JSON.stringify({ currentTime: "2023-02-29T00:00:00.000Z" }), "application/json", "non-leap-year Feb 29"],
+      [JSON.stringify({ currentTime: "2024-13-01T00:00:00.000Z" }), "application/json", "month 13"],
+      [JSON.stringify({ currentTime: "2024-01-01T24:00:00.000Z" }), "application/json", "hour 24"]
+    ];
+
+    for (const [body, contentType, label] of cases) {
+      const result = await setClock(baseUrl, id, body, { contentType });
+      assert.equal(result.status, 400, label);
+      assert.equal(result.body.error, "bad_request", label);
+      assert.equal(typeof result.body.message, "string", label);
+    }
+
+    const read = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.deepEqual(read.body, { scenarioId: id, currentTime: null });
+  });
+});
+
+test("clock reads and writes do not change revision, events, sequences, or cursors", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 4);
+
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=2`);
+    assert.equal(page.status, 200);
+    assert.equal(typeof page.body.nextCursor, "string");
+
+    const before = await requestJson(baseUrl, `/scenarios/${id}`);
+
+    const unset = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.equal(unset.status, 200);
+    const set = await setClock(baseUrl, id, { currentTime: "2030-01-01T00:00:00.000Z" });
+    assert.equal(set.status, 200);
+    const read = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.equal(read.status, 200);
+    const advanced = await setClock(baseUrl, id, { currentTime: "2031-01-01T00:00:00.000Z" });
+    assert.equal(advanced.status, 200);
+
+    const after = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.deepEqual(after.body, before.body);
+    assert.equal(after.body.revision, 4);
+    assert.deepEqual(after.body.events, events);
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 4);
+    assert.equal(scenario.events.length, 4);
+    assert.deepEqual(scenario.events.map(event => event.sequence), [1, 2, 3, 4]);
+
+    // The cursor issued before any clock operation is still valid.
+    const followed = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=2&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(followed.status, 200);
+    assert.deepEqual(followed.body.events.map(event => event.sequence), [3, 4]);
+    assert.equal(followed.body.nextCursor, null);
+  }, createApp(store));
+});
+
+test("events appended without occurredAt use the scenario clock when set", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Clocked events" })
+    });
+    const id = created.body.id;
+
+    // Without a clock the server still generates the timestamp.
+    const before = Date.now();
+    const serverTimed = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "server-time" })
+    });
+    const after = Date.now();
+    assert.equal(serverTimed.status, 201);
+    const generated = Date.parse(serverTimed.body.occurredAt);
+    assert.ok(generated >= before && generated <= after);
+
+    const set = await setClock(baseUrl, id, { currentTime: "2030-05-01T08:00:00.000Z" });
+    assert.equal(set.status, 200);
+
+    const clocked = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "clock-time" })
+    });
+    assert.equal(clocked.status, 201);
+    assert.equal(clocked.body.occurredAt, "2030-05-01T08:00:00.000Z");
+    assert.equal(clocked.body.sequence, 2);
+
+    // The clock does not advance by itself.
+    const again = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "clock-time-again" })
+    });
+    assert.equal(again.status, 201);
+    assert.equal(again.body.occurredAt, "2030-05-01T08:00:00.000Z");
+
+    // An explicit occurredAt keeps the existing validation and is stored as given.
+    const explicit = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "explicit", occurredAt: "2030-05-01T09:00:00.000Z" })
+    });
+    assert.equal(explicit.status, 201);
+    assert.equal(explicit.body.occurredAt, "2030-05-01T09:00:00.000Z");
+
+    const regressing = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "explicit", occurredAt: "2030-05-01T08:59:59.999Z" })
+    });
+    assert.equal(regressing.status, 400);
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(fetched.body.revision, 4);
+    assert.deepEqual(
+      fetched.body.events.map(event => event.occurredAt),
+      [
+        serverTimed.body.occurredAt,
+        "2030-05-01T08:00:00.000Z",
+        "2030-05-01T08:00:00.000Z",
+        "2030-05-01T09:00:00.000Z"
+      ]
+    );
+  });
+});
+
+test("branches start with a null clock and stay isolated from parent and siblings", async () => {
+  await withServer(async baseUrl => {
+    const { id: parentId } = await createScenarioWithEvents(baseUrl, 2, "Parent");
+
+    const parentClock = await setClock(baseUrl, parentId, { currentTime: "2030-01-01T00:00:00.000Z" });
+    assert.equal(parentClock.status, 200);
+
+    const first = await branchAt(baseUrl, parentId, { name: "One", fromRevision: 2 });
+    const second = await branchAt(baseUrl, parentId, { name: "Two", fromRevision: 2 });
+    assert.equal(first.status, 201);
+    assert.equal(second.status, 201);
+
+    // Branches do not inherit the parent's clock.
+    for (const branch of [first.body, second.body]) {
+      const read = await requestJson(baseUrl, `/scenarios/${branch.id}/clock`);
+      assert.deepEqual(read.body, { scenarioId: branch.id, currentTime: null });
+    }
+
+    // A branch without a clock still uses server-generated event times.
+    const branchEvent = await requestJson(baseUrl, `/scenarios/${first.body.id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "branch-event" })
+    });
+    assert.equal(branchEvent.status, 201);
+    assert.notEqual(branchEvent.body.occurredAt, "2030-01-01T00:00:00.000Z");
+    assert.ok(Date.parse(branchEvent.body.occurredAt) >= Date.parse("2025-01-01T00:00:00.000Z"));
+
+    // Setting one branch's clock affects neither the parent nor the sibling.
+    const setFirst = await setClock(baseUrl, first.body.id, { currentTime: "2031-06-01T00:00:00.000Z" });
+    assert.equal(setFirst.status, 200);
+
+    const parentRead = await requestJson(baseUrl, `/scenarios/${parentId}/clock`);
+    assert.deepEqual(parentRead.body, { scenarioId: parentId, currentTime: "2030-01-01T00:00:00.000Z" });
+    const secondRead = await requestJson(baseUrl, `/scenarios/${second.body.id}/clock`);
+    assert.deepEqual(secondRead.body, { scenarioId: second.body.id, currentTime: null });
+
+    // Advancing the parent's clock does not move the branch's clock.
+    const parentAdvanced = await setClock(baseUrl, parentId, { currentTime: "2032-01-01T00:00:00.000Z" });
+    assert.equal(parentAdvanced.status, 200);
+    const firstRead = await requestJson(baseUrl, `/scenarios/${first.body.id}/clock`);
+    assert.deepEqual(firstRead.body, { scenarioId: first.body.id, currentTime: "2031-06-01T00:00:00.000Z" });
+
+    // Each branch's clock bounds only its own timeline.
+    const tooEarly = await setClock(baseUrl, second.body.id, { currentTime: "2020-01-01T00:00:00.000Z" });
+    assert.equal(tooEarly.status, 400);
+    const secondOk = await setClock(baseUrl, second.body.id, { currentTime: "2030-06-01T00:00:00.000Z" });
+    assert.equal(secondOk.status, 200);
+  });
+});
