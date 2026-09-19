@@ -98,7 +98,11 @@ function isNonEmptyString(value) {
 }
 
 export function createScenarioStore() {
-  return { scenarios: new Map() };
+  return { scenarios: new Map(), clocks: new Map() };
+}
+
+function clockSnapshot(store, id) {
+  return { scenarioId: id, currentTime: store.clocks.get(id) ?? null };
 }
 
 export function createApp(store = createScenarioStore()) {
@@ -236,6 +240,49 @@ export function createApp(store = createScenarioStore()) {
     sendJson(response, 200, scenario);
   }
 
+  function getClock(response, id) {
+    if (!store.scenarios.has(id)) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+    sendJson(response, 200, clockSnapshot(store, id));
+  }
+
+  async function setClock(request, response, id) {
+    const scenario = store.scenarios.get(id);
+    if (!scenario) {
+      notFound(response, "Scenario not found");
+      return;
+    }
+
+    const body = await readJsonObject(request, response);
+    if (body === null) {
+      return;
+    }
+
+    const parsed = parseUtcTimestamp(body.currentTime);
+    if (parsed === null) {
+      badRequest(response, "currentTime must be a UTC timestamp formatted as YYYY-MM-DDTHH:mm:ss.SSSZ");
+      return;
+    }
+
+    const currentTime = body.currentTime;
+    const currentTimeMs = parsed.getTime();
+    const previousClock = store.clocks.get(id);
+    if (previousClock !== undefined && currentTimeMs < Date.parse(previousClock)) {
+      badRequest(response, "currentTime must not be earlier than the scenario's current clock time");
+      return;
+    }
+    const lastEvent = scenario.events[scenario.events.length - 1];
+    if (lastEvent !== undefined && currentTimeMs < Date.parse(lastEvent.occurredAt)) {
+      badRequest(response, "currentTime must not be earlier than the last event's occurredAt");
+      return;
+    }
+
+    store.clocks.set(id, currentTime);
+    sendJson(response, 200, { scenarioId: id, currentTime });
+  }
+
   async function appendEvent(request, response, id) {
     const scenario = store.scenarios.get(id);
     if (!scenario) {
@@ -259,7 +306,7 @@ export function createApp(store = createScenarioStore()) {
 
     let occurredAt;
     if (body.occurredAt === undefined) {
-      occurredAt = new Date().toISOString();
+      occurredAt = store.clocks.get(id) ?? new Date().toISOString();
     } else {
       const parsed = parseUtcTimestamp(body.occurredAt);
       if (parsed === null) {
@@ -452,6 +499,16 @@ export function createApp(store = createScenarioStore()) {
         const id = decodeURIComponent(segments[2]);
         if (request.method === "GET") {
           getScenario(response, id);
+          return;
+        }
+      } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "clock") {
+        const id = decodeURIComponent(segments[2]);
+        if (request.method === "POST") {
+          await setClock(request, response, id);
+          return;
+        }
+        if (request.method === "GET") {
+          getClock(response, id);
           return;
         }
       } else if (segments.length === 4 && segments[1] === "scenarios" && segments[3] === "branches") {
