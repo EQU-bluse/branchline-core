@@ -846,3 +846,244 @@ test("paged event objects match the create-event response shape", async () => {
     }
   });
 });
+
+test("an explicit occurredAt is preserved in the response, scenario, and event list", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Deterministic" })
+    });
+    const id = created.body.id;
+
+    const first = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "start", occurredAt: "2024-03-01T10:00:00.000Z" })
+    });
+    assert.equal(first.status, 201);
+    assert.equal(first.body.occurredAt, "2024-03-01T10:00:00.000Z");
+    assert.equal(first.body.sequence, 1);
+
+    const second = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "next", occurredAt: "2024-03-01T11:30:00.000Z" })
+    });
+    assert.equal(second.status, 201);
+    assert.equal(second.body.occurredAt, "2024-03-01T11:30:00.000Z");
+    assert.equal(second.body.sequence, 2);
+
+    const scenario = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(scenario.status, 200);
+    assert.deepEqual(
+      scenario.body.events.map(event => event.occurredAt),
+      ["2024-03-01T10:00:00.000Z", "2024-03-01T11:30:00.000Z"]
+    );
+
+    const listed = await requestJson(baseUrl, `/scenarios/${id}/events`);
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body.events, [first.body, second.body]);
+
+    // Explicit timestamps are range-queryable through the existing filters.
+    const ranged = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?from=2024-03-01T10:30:00.000Z&to=2024-03-01T12:00:00.000Z`
+    );
+    assert.equal(ranged.status, 200);
+    assert.deepEqual(
+      ranged.body.events.map(event => event.sequence),
+      [2]
+    );
+  });
+});
+
+test("equal and increasing explicit occurredAt values are accepted", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Monotonic" })
+    });
+    const id = created.body.id;
+
+    const stamps = [
+      "2024-05-01T00:00:00.000Z",
+      "2024-05-01T00:00:00.000Z",
+      "2024-05-01T00:00:00.001Z",
+      "2024-05-01T00:00:00.001Z",
+      "2024-05-02T00:00:00.000Z"
+    ];
+    for (const [index, occurredAt] of stamps.entries()) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type: `event-${index + 1}`, occurredAt })
+      });
+      assert.equal(result.status, 201, occurredAt);
+      assert.equal(result.body.occurredAt, occurredAt);
+      assert.equal(result.body.sequence, index + 1);
+    }
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(fetched.body.revision, stamps.length);
+    assert.deepEqual(
+      fetched.body.events.map(event => event.occurredAt),
+      stamps
+    );
+  });
+});
+
+test("a regressing occurredAt returns 400 without side effects", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Guarded timeline" })
+    });
+    const id = created.body.id;
+
+    for (const occurredAt of ["2024-06-01T00:00:00.000Z", "2024-06-03T00:00:00.000Z"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type: "pinned", occurredAt })
+      });
+      assert.equal(result.status, 201);
+    }
+
+    // A cursor issued now must survive the rejected write.
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=1`);
+    assert.equal(page.status, 200);
+    assert.equal(typeof page.body.nextCursor, "string");
+
+    for (const occurredAt of ["2024-06-02T23:59:59.999Z", "2020-01-01T00:00:00.000Z"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type: "late", occurredAt })
+      });
+      assert.equal(result.status, 400, occurredAt);
+      assert.equal(result.body.error, "bad_request");
+    }
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 2);
+    assert.equal(scenario.events.length, 2);
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(fetched.body.revision, 2);
+    assert.equal(fetched.body.events.length, 2);
+
+    const followUp = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=1&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(followUp.status, 200);
+    assert.deepEqual(
+      followUp.body.events.map(event => event.sequence),
+      [2]
+    );
+  }, createApp(store));
+});
+
+test("invalid explicit occurredAt values return 400 without side effects", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Validated" })
+    });
+    const id = created.body.id;
+
+    const cases = [
+      [JSON.stringify({ type: "x", occurredAt: 1717171717 }), "numeric occurredAt"],
+      [JSON.stringify({ type: "x", occurredAt: null }), "null occurredAt"],
+      [JSON.stringify({ type: "x", occurredAt: true }), "boolean occurredAt"],
+      [JSON.stringify({ type: "x", occurredAt: {} }), "object occurredAt"],
+      [JSON.stringify({ type: "x", occurredAt: [] }), "array occurredAt"],
+      [JSON.stringify({ type: "x", occurredAt: "2024-01-01T00:00:00Z" }), "missing milliseconds"],
+      [JSON.stringify({ type: "x", occurredAt: "2024-01-01T00:00:00.000+00:00" }), "offset instead of Z"],
+      [JSON.stringify({ type: "x", occurredAt: "2024-01-01 00:00:00.000Z" }), "space separator"],
+      [JSON.stringify({ type: "x", occurredAt: "not-a-date" }), "not a date"],
+      [JSON.stringify({ type: "x", occurredAt: "2024-02-30T00:00:00.000Z" }), "nonexistent day"],
+      [JSON.stringify({ type: "x", occurredAt: "2023-02-29T00:00:00.000Z" }), "non-leap-year Feb 29"],
+      [JSON.stringify({ type: "x", occurredAt: "2024-13-01T00:00:00.000Z" }), "month 13"],
+      [JSON.stringify({ type: "x", occurredAt: "2024-01-01T24:00:00.000Z" }), "hour 24"]
+    ];
+
+    for (const [body, label] of cases) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body
+      });
+      assert.equal(result.status, 400, label);
+      assert.equal(result.body.error, "bad_request", label);
+    }
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 0);
+    assert.deepEqual(scenario.events, []);
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(fetched.body.revision, 0);
+    assert.deepEqual(fetched.body.events, []);
+  }, createApp(store));
+});
+
+test("omitting occurredAt keeps the server-generated timestamp behavior", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Server time" })
+    });
+    const id = created.body.id;
+
+    const before = Date.now();
+    const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "now" })
+    });
+    const after = Date.now();
+
+    assert.equal(result.status, 201);
+    assert.equal(result.body.sequence, 1);
+    const occurredAt = Date.parse(result.body.occurredAt);
+    assert.ok(!Number.isNaN(occurredAt));
+    assert.ok(occurredAt >= before && occurredAt <= after);
+  });
+});
+
+test("explicit occurredAt monotonicity is enforced per scenario", async () => {
+  await withServer(async baseUrl => {
+    const a = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "A" })
+    });
+    const b = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "B" })
+    });
+
+    const pinned = await requestJson(baseUrl, `/scenarios/${a.body.id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "late", occurredAt: "2025-01-01T00:00:00.000Z" })
+    });
+    assert.equal(pinned.status, 201);
+
+    // Scenario B is unaffected by A's timeline position.
+    const earlier = await requestJson(baseUrl, `/scenarios/${b.body.id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "early", occurredAt: "2020-01-01T00:00:00.000Z" })
+    });
+    assert.equal(earlier.status, 201);
+    assert.equal(earlier.body.occurredAt, "2020-01-01T00:00:00.000Z");
+
+    // A still rejects a regression against its own last event.
+    const regressing = await requestJson(baseUrl, `/scenarios/${a.body.id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "backwards", occurredAt: "2024-12-31T23:59:59.999Z" })
+    });
+    assert.equal(regressing.status, 400);
+
+    const fetchedA = await requestJson(baseUrl, `/scenarios/${a.body.id}`);
+    const fetchedB = await requestJson(baseUrl, `/scenarios/${b.body.id}`);
+    assert.equal(fetchedA.body.revision, 1);
+    assert.equal(fetchedA.body.events.length, 1);
+    assert.equal(fetchedB.body.revision, 1);
+    assert.equal(fetchedB.body.events.length, 1);
+  });
+});

@@ -213,11 +213,28 @@ export function createApp(store = createScenarioStore()) {
       return;
     }
 
+    let occurredAt;
+    if (body.occurredAt === undefined) {
+      occurredAt = new Date().toISOString();
+    } else {
+      const parsed = parseUtcTimestamp(body.occurredAt);
+      if (parsed === null) {
+        badRequest(response, "occurredAt must be a UTC timestamp formatted as YYYY-MM-DDTHH:mm:ss.SSSZ");
+        return;
+      }
+      const last = scenario.events[scenario.events.length - 1];
+      if (last !== undefined && parsed.getTime() < Date.parse(last.occurredAt)) {
+        badRequest(response, "occurredAt must not be earlier than the previous event's occurredAt");
+        return;
+      }
+      occurredAt = body.occurredAt;
+    }
+
     const event = {
       id: randomUUID(),
       type: body.type,
       payload: body.payload ?? {},
-      occurredAt: new Date().toISOString(),
+      occurredAt,
       sequence: scenario.events.length + 1
     };
     scenario.events.push(event);
