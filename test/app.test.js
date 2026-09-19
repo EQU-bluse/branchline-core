@@ -1748,3 +1748,547 @@ test("branches start with a null clock and stay isolated from parent and sibling
     assert.equal(secondOk.status, 200);
   });
 });
+
+async function postRule(baseUrl, id, body, options = {}) {
+  return requestJson(baseUrl, `/scenarios/${id}/rules`, {
+    method: "POST",
+    contentType: options.contentType,
+    body: typeof body === "string" ? body : JSON.stringify(body)
+  });
+}
+
+test("POST /scenarios/:id/rules creates a rule with a unique id and persists it", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Rules" })
+    });
+    const id = created.body.id;
+
+    const first = await postRule(baseUrl, id, {
+      name: "First rule",
+      when: { type: "start" },
+      then: { type: "started", payload: { ok: true } }
+    });
+    assert.equal(first.status, 201);
+    const rule = first.body;
+    assert.equal(typeof rule.id, "string");
+    assert.ok(rule.id.length > 0);
+    assert.equal(rule.name, "First rule");
+    assert.deepEqual(rule.when, { type: "start" });
+    assert.deepEqual(rule.then, { type: "started", payload: { ok: true } });
+
+    const second = await postRule(baseUrl, id, {
+      name: "Rule without payload",
+      when: { type: "other" },
+      then: { type: "derived" }
+    });
+    assert.equal(second.status, 201);
+    assert.notEqual(second.body.id, rule.id);
+    assert.deepEqual(second.body.then, { type: "derived" });
+
+    const listed = await requestJson(baseUrl, `/scenarios/${id}/rules`);
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listed.body, [rule, second.body]);
+  });
+});
+
+test("GET rules returns an empty list for a scenario without rules and 404 for an unknown scenario", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "No rules" })
+    });
+
+    const empty = await requestJson(baseUrl, `/scenarios/${created.body.id}/rules`);
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.body, []);
+
+    const missing = await requestJson(baseUrl, "/scenarios/missing/rules");
+    assert.equal(missing.status, 404);
+    assert.deepEqual(missing.body, { error: "not_found", message: "Scenario not found" });
+  });
+});
+
+test("POST rules on an unknown scenario returns 404, taking precedence over body validation", async () => {
+  await withServer(async baseUrl => {
+    const valid = await postRule(baseUrl, "missing", {
+      name: "x",
+      when: { type: "a" },
+      then: { type: "b" }
+    });
+    assert.equal(valid.status, 404);
+    assert.equal(valid.body.error, "not_found");
+
+    const invalid = await postRule(baseUrl, "missing", { name: "", when: {}, then: {} });
+    assert.equal(invalid.status, 404);
+    assert.equal(invalid.body.error, "not_found");
+
+    const malformed = await postRule(baseUrl, "missing", "{");
+    assert.equal(malformed.status, 404);
+  });
+});
+
+test("invalid rule requests return 400 and write nothing", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Guarded rules" })
+    });
+    const id = created.body.id;
+
+    const cases = [
+      ["", undefined, "empty body"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: "b" } }), "text/plain", "wrong media type"],
+      ["{", "application/json", "malformed JSON"],
+      ["[]", "application/json", "JSON array body"],
+      [JSON.stringify({ when: { type: "a" }, then: { type: "b" } }), "application/json", "missing name"],
+      [JSON.stringify({ name: "", when: { type: "a" }, then: { type: "b" } }), "application/json", "empty name"],
+      [JSON.stringify({ name: 4, when: { type: "a" }, then: { type: "b" } }), "application/json", "non-string name"],
+      [JSON.stringify({ name: "x", then: { type: "b" } }), "application/json", "missing when"],
+      [JSON.stringify({ name: "x", when: null, then: { type: "b" } }), "application/json", "null when"],
+      [JSON.stringify({ name: "x", when: [], then: { type: "b" } }), "application/json", "array when"],
+      [JSON.stringify({ name: "x", when: "start", then: { type: "b" } }), "application/json", "string when"],
+      [JSON.stringify({ name: "x", when: {}, then: { type: "b" } }), "application/json", "when missing type"],
+      [JSON.stringify({ name: "x", when: { type: "" }, then: { type: "b" } }), "application/json", "empty when.type"],
+      [JSON.stringify({ name: "x", when: { type: 5 }, then: { type: "b" } }), "application/json", "non-string when.type"],
+      [JSON.stringify({ name: "x", when: { type: "a", extra: 1 }, then: { type: "b" } }), "application/json", "extra when field"],
+      [JSON.stringify({ name: "x", when: { type: "a" } }), "application/json", "missing then"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: null }), "application/json", "null then"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: [] }), "application/json", "array then"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: "out" }), "application/json", "string then"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: {} }), "application/json", "then missing type"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: "" } }), "application/json", "empty then.type"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: 3 } }), "application/json", "non-string then.type"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: "b", payload: [] } }), "application/json", "array payload"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: "b", payload: "no" } }), "application/json", "string payload"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: "b", payload: null } }), "application/json", "null payload"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: "b", extra: 1 } }), "application/json", "extra then field"],
+      [JSON.stringify({ name: "x", when: { type: "a" }, then: { type: "b" }, bogus: 1 }), "application/json", "extra top-level field"]
+    ];
+
+    for (const [body, contentType, label] of cases) {
+      const result = await postRule(baseUrl, id, body, { contentType });
+      assert.equal(result.status, 400, label);
+      assert.equal(result.body.error, "bad_request", label);
+      assert.equal(typeof result.body.message, "string", label);
+    }
+
+    const listed = await requestJson(baseUrl, `/scenarios/${id}/rules`);
+    assert.deepEqual(listed.body, []);
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(fetched.body.revision, 0);
+  });
+});
+
+test("rule creation and listing do not change revision, events, clock, or cursors", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 3);
+
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=2`);
+    assert.equal(typeof page.body.nextCursor, "string");
+
+    const before = await requestJson(baseUrl, `/scenarios/${id}`);
+    const clockBefore = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+
+    const rule = await postRule(baseUrl, id, {
+      name: "R",
+      when: { type: "event-1" },
+      then: { type: "out", payload: { x: 1 } }
+    });
+    assert.equal(rule.status, 201);
+
+    const listed = await requestJson(baseUrl, `/scenarios/${id}/rules`);
+    assert.equal(listed.body.length, 1);
+
+    const after = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.deepEqual(after.body, before.body);
+    assert.equal(after.body.revision, 3);
+    assert.deepEqual(after.body.events, events);
+
+    const clockAfter = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.deepEqual(clockAfter.body, clockBefore.body);
+
+    const followed = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=2&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(followed.status, 200);
+    assert.deepEqual(followed.body.events.map(event => event.sequence), [3]);
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 3);
+    assert.equal(scenario.events.length, 3);
+  }, createApp(store));
+});
+
+test("GET replay derives results in sequence and rule creation order from current events", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Replay" })
+    });
+    const id = created.body.id;
+
+    const stamps = [
+      "2024-04-01T00:00:00.000Z",
+      "2024-04-02T00:00:00.000Z",
+      "2024-04-03T00:00:00.000Z"
+    ];
+    const appended = [];
+    for (const [index, type] of ["alpha", "beta", "alpha"].entries()) {
+      const result = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type, occurredAt: stamps[index] })
+      });
+      assert.equal(result.status, 201);
+      appended.push(result.body);
+    }
+
+    const r1 = await postRule(baseUrl, id, { name: "R1", when: { type: "alpha" }, then: { type: "one", payload: { n: 1 } } });
+    const r2 = await postRule(baseUrl, id, { name: "R2", when: { type: "alpha" }, then: { type: "two" } });
+    const r3 = await postRule(baseUrl, id, { name: "R3", when: { type: "beta" }, then: { type: "three", payload: { n: 3 } } });
+    assert.equal(r1.status, 201);
+    assert.equal(r2.status, 201);
+    assert.equal(r3.status, 201);
+
+    const replay = await requestJson(baseUrl, `/scenarios/${id}/replay`);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.revision, 3);
+    assert.deepEqual(replay.body.results, [
+      {
+        ruleId: r1.body.id,
+        sourceSequence: 1,
+        type: "one",
+        payload: { n: 1 },
+        occurredAt: appended[0].occurredAt
+      },
+      {
+        ruleId: r2.body.id,
+        sourceSequence: 1,
+        type: "two",
+        payload: {},
+        occurredAt: appended[0].occurredAt
+      },
+      {
+        ruleId: r3.body.id,
+        sourceSequence: 2,
+        type: "three",
+        payload: { n: 3 },
+        occurredAt: appended[1].occurredAt
+      },
+      {
+        ruleId: r1.body.id,
+        sourceSequence: 3,
+        type: "one",
+        payload: { n: 1 },
+        occurredAt: appended[2].occurredAt
+      },
+      {
+        ruleId: r2.body.id,
+        sourceSequence: 3,
+        type: "two",
+        payload: {},
+        occurredAt: appended[2].occurredAt
+      }
+    ]);
+
+    // Repeating the read-only replay yields identical output.
+    const again = await requestJson(baseUrl, `/scenarios/${id}/replay`);
+    assert.deepEqual(again.body, replay.body);
+  });
+});
+
+test("replay on a scenario without events or rules returns an empty result set", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Quiet" })
+    });
+
+    const replay = await requestJson(baseUrl, `/scenarios/${created.body.id}/replay`);
+    assert.equal(replay.status, 200);
+    assert.deepEqual(replay.body, { revision: 0, results: [] });
+  });
+});
+
+test("replay returns 404 for an unknown scenario", async () => {
+  await withServer(async baseUrl => {
+    const result = await requestJson(baseUrl, "/scenarios/missing/replay");
+    assert.equal(result.status, 404);
+    assert.deepEqual(result.body, { error: "not_found", message: "Scenario not found" });
+  });
+});
+
+test("replay is read-only for revision, events, clock, and cursors", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const { id, events } = await createScenarioWithEvents(baseUrl, 3);
+    await postRule(baseUrl, id, { name: "R", when: { type: "event-2" }, then: { type: "out" } });
+
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=1`);
+    assert.equal(typeof page.body.nextCursor, "string");
+    await setClock(baseUrl, id, { currentTime: "2030-01-01T00:00:00.000Z" });
+
+    const before = await requestJson(baseUrl, `/scenarios/${id}`);
+    const replay = await requestJson(baseUrl, `/scenarios/${id}/replay`);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.body.results.length, 1);
+    const replayAgain = await requestJson(baseUrl, `/scenarios/${id}/replay`);
+    assert.deepEqual(replayAgain.body, replay.body);
+
+    const after = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.deepEqual(after.body, before.body);
+    assert.equal(after.body.revision, 3);
+    assert.deepEqual(after.body.events, events);
+
+    const clock = await requestJson(baseUrl, `/scenarios/${id}/clock`);
+    assert.deepEqual(clock.body, { scenarioId: id, currentTime: "2030-01-01T00:00:00.000Z" });
+
+    const followed = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=1&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(followed.status, 200);
+    assert.deepEqual(followed.body.events.map(event => event.sequence), [2]);
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 3);
+    assert.equal(scenario.events.length, 3);
+  }, createApp(store));
+});
+
+test("branches copy history but never inherit parent rules, and rule sets stay isolated", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Rule parent" })
+    });
+    const parentId = created.body.id;
+
+    for (const type of ["alpha", "beta"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${parentId}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type, occurredAt: "2024-08-01T00:00:00.000Z" })
+      });
+      assert.equal(result.status, 201);
+    }
+
+    const parentRule = await postRule(baseUrl, parentId, {
+      name: "Parent rule",
+      when: { type: "alpha" },
+      then: { type: "parent-out" }
+    });
+    assert.equal(parentRule.status, 201);
+
+    const branch = await branchAt(baseUrl, parentId, { name: "Fork", fromRevision: 2 });
+    assert.equal(branch.status, 201);
+    const branchId = branch.body.id;
+
+    // The branch copies events but starts with no rules.
+    const branchRules = await requestJson(baseUrl, `/scenarios/${branchId}/rules`);
+    assert.equal(branchRules.status, 200);
+    assert.deepEqual(branchRules.body, []);
+
+    const branchReplay = await requestJson(baseUrl, `/scenarios/${branchId}/replay`);
+    assert.equal(branchReplay.status, 200);
+    assert.equal(branchReplay.body.revision, 2);
+    assert.deepEqual(branchReplay.body.results, []);
+
+    // Adding a rule to the branch only affects the branch's replay.
+    const branchRule = await postRule(baseUrl, branchId, {
+      name: "Branch rule",
+      when: { type: "alpha" },
+      then: { type: "branch-out", payload: { where: "branch" } }
+    });
+    assert.equal(branchRule.status, 201);
+
+    const branchReplay2 = await requestJson(baseUrl, `/scenarios/${branchId}/replay`);
+    assert.deepEqual(branchReplay2.body.results, [
+      {
+        ruleId: branchRule.body.id,
+        sourceSequence: 1,
+        type: "branch-out",
+        payload: { where: "branch" },
+        occurredAt: "2024-08-01T00:00:00.000Z"
+      }
+    ]);
+
+    const parentReplay = await requestJson(baseUrl, `/scenarios/${parentId}/replay`);
+    assert.deepEqual(parentReplay.body.results, [
+      {
+        ruleId: parentRule.body.id,
+        sourceSequence: 1,
+        type: "parent-out",
+        payload: {},
+        occurredAt: "2024-08-01T00:00:00.000Z"
+      }
+    ]);
+
+    // A rule added to the parent after the fork is not visible on the branch.
+    const laterParentRule = await postRule(baseUrl, parentId, {
+      name: "Later parent rule",
+      when: { type: "beta" },
+      then: { type: "later-out" }
+    });
+    assert.equal(laterParentRule.status, 201);
+
+    const branchRulesAfter = await requestJson(baseUrl, `/scenarios/${branchId}/rules`);
+    assert.deepEqual(branchRulesAfter.body.map(rule => rule.id), [branchRule.body.id]);
+
+    const parentRules = await requestJson(baseUrl, `/scenarios/${parentId}/rules`);
+    assert.deepEqual(parentRules.body.map(rule => rule.id), [parentRule.body.id, laterParentRule.body.id]);
+
+    // Appending to the branch and replaying there does not touch the parent's results.
+    const branchEvent = await requestJson(baseUrl, `/scenarios/${branchId}/events`, {
+      method: "POST",
+      body: JSON.stringify({
+        type: "alpha",
+        occurredAt: "2024-08-02T00:00:00.000Z"
+      })
+    });
+    assert.equal(branchEvent.status, 201);
+    assert.equal(branchEvent.body.sequence, 3);
+
+    const branchReplay3 = await requestJson(baseUrl, `/scenarios/${branchId}/replay`);
+    assert.equal(branchReplay3.body.revision, 3);
+    assert.deepEqual(
+      branchReplay3.body.results.map(result => [result.sourceSequence, result.type]),
+      [[1, "branch-out"], [3, "branch-out"]]
+    );
+
+    const parentReplay2 = await requestJson(baseUrl, `/scenarios/${parentId}/replay`);
+    assert.equal(parentReplay2.body.revision, 2);
+    assert.deepEqual(
+      parentReplay2.body.results.map(result => [result.sourceSequence, result.type]),
+      [[1, "parent-out"], [2, "later-out"]]
+    );
+  });
+});
+
+test("a default event time from a clock earlier than the last event returns 400 without side effects", async () => {
+  const store = createScenarioStore();
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Stale clock" })
+    });
+    const id = created.body.id;
+
+    const clockSet = await setClock(baseUrl, id, { currentTime: "2024-09-01T00:00:00.000Z" });
+    assert.equal(clockSet.status, 200);
+
+    // A clock-timed event lands at the clock time; then an explicit event advances past it.
+    const clocked = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "clock-timed" })
+    });
+    assert.equal(clocked.status, 201);
+    assert.equal(clocked.body.occurredAt, "2024-09-01T00:00:00.000Z");
+
+    const explicit = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "later", occurredAt: "2024-09-05T00:00:00.000Z" })
+    });
+    assert.equal(explicit.status, 201);
+    assert.equal(explicit.body.sequence, 2);
+
+    // A cursor issued before the rejected append must survive it.
+    const page = await requestJson(baseUrl, `/scenarios/${id}/events?limit=1`);
+    assert.equal(page.status, 200);
+    assert.equal(typeof page.body.nextCursor, "string");
+
+    const stale = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "would-regress" })
+    });
+    assert.equal(stale.status, 400);
+    assert.equal(stale.body.error, "bad_request");
+
+    const scenario = store.scenarios.get(id);
+    assert.equal(scenario.revision, 2);
+    assert.equal(scenario.events.length, 2);
+    assert.equal(store.clocks.get(id), "2024-09-01T00:00:00.000Z");
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${id}`);
+    assert.equal(fetched.body.revision, 2);
+    assert.deepEqual(fetched.body.events.map(event => event.sequence), [1, 2]);
+
+    const followed = await requestJson(
+      baseUrl,
+      `/scenarios/${id}/events?limit=1&cursor=${encodeURIComponent(page.body.nextCursor)}`
+    );
+    assert.equal(followed.status, 200);
+    assert.deepEqual(followed.body.events.map(event => event.sequence), [2]);
+
+    // Advancing the clock to the last event time makes default times valid again (equal allowed).
+    const advanced = await setClock(baseUrl, id, { currentTime: "2024-09-05T00:00:00.000Z" });
+    assert.equal(advanced.status, 200);
+
+    const equal = await requestJson(baseUrl, `/scenarios/${id}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "equal-time" })
+    });
+    assert.equal(equal.status, 201);
+    assert.equal(equal.body.occurredAt, "2024-09-05T00:00:00.000Z");
+    assert.equal(equal.body.sequence, 3);
+  }, createApp(store));
+});
+
+test("the stale-clock boundary is enforced per scenario including branches", async () => {
+  await withServer(async baseUrl => {
+    const created = await requestJson(baseUrl, "/scenarios", {
+      method: "POST",
+      body: JSON.stringify({ name: "Parent" })
+    });
+    const parentId = created.body.id;
+
+    for (const occurredAt of ["2024-10-01T00:00:00.000Z", "2024-10-05T00:00:00.000Z"]) {
+      const result = await requestJson(baseUrl, `/scenarios/${parentId}/events`, {
+        method: "POST",
+        body: JSON.stringify({ type: "pinned", occurredAt })
+      });
+      assert.equal(result.status, 201);
+    }
+
+    const branch = await branchAt(baseUrl, parentId, { name: "Fork", fromRevision: 2 });
+    assert.equal(branch.status, 201);
+    const branchId = branch.body.id;
+
+    // The branch clock cannot be set before the copied prefix's last event...
+    const tooEarly = await setClock(baseUrl, branchId, { currentTime: "2024-10-01T00:00:00.000Z" });
+    assert.equal(tooEarly.status, 400);
+
+    // ...but once set to an allowed time, an explicit later event followed by a default
+    // append hits the same regression boundary independently of the parent.
+    const allowed = await setClock(baseUrl, branchId, { currentTime: "2024-10-05T00:00:00.000Z" });
+    assert.equal(allowed.status, 200);
+
+    const explicit = await requestJson(baseUrl, `/scenarios/${branchId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "later", occurredAt: "2024-10-10T00:00:00.000Z" })
+    });
+    assert.equal(explicit.status, 201);
+
+    const stale = await requestJson(baseUrl, `/scenarios/${branchId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "would-regress" })
+    });
+    assert.equal(stale.status, 400);
+    assert.equal(stale.body.error, "bad_request");
+
+    const fetched = await requestJson(baseUrl, `/scenarios/${branchId}`);
+    assert.equal(fetched.body.revision, 3);
+    assert.equal(fetched.body.events.length, 3);
+
+    // The parent has no clock set and is unaffected.
+    const parentAppended = await requestJson(baseUrl, `/scenarios/${parentId}/events`, {
+      method: "POST",
+      body: JSON.stringify({ type: "server-time" })
+    });
+    assert.equal(parentAppended.status, 201);
+    assert.equal(parentAppended.body.sequence, 3);
+  });
+});
